@@ -71,6 +71,7 @@ export interface RelayGiftEvent {
   giftCount: number;
   diamondValue: number | null;
   targetUsername: string | null;
+  targetNickname: string | null;
   createdAt: number;
 }
 
@@ -140,6 +141,7 @@ export interface QueueItemPayload {
   giftCount?: number;
   diamondValue?: number | null;
   targetUsername?: string | null;
+  targetNickname?: string | null;
   username?: string | null;
   comment?: string;
   matchedRule?: string;
@@ -185,6 +187,7 @@ export interface GiftLogItem {
   giftCount: number;
   diamondValue: number | null;
   targetUsername: string | null;
+  targetNickname: string | null;
   /** none = logged only; pending/done = alert queue state */
   alertStatus: "none" | QueueItemStatus;
   queueItemId: string | null;
@@ -215,4 +218,31 @@ export interface PushNotificationPayload {
   streamId: string;
   queueItemId: string;
   actions?: Array<{ action: string; title: string }>;
+}
+
+export function formatGiftTarget(
+  username: string | null | undefined,
+  nickname?: string | null,
+): string | null {
+  const handle = username?.trim() || null;
+  const nick = nickname?.trim() || null;
+  if (!handle && !nick) return null;
+  if (handle && nick && nick.toLowerCase() !== handle.toLowerCase()) {
+    return `${nick} @${handle}`;
+  }
+  return handle ? `@${handle}` : nick;
+}
+
+export function formatGiftAlertBody(input: {
+  senderUsername: string | null;
+  giftName: string | null;
+  giftCount: number;
+  targetUsername: string | null;
+  targetNickname?: string | null;
+}): string {
+  const sender = input.senderUsername ?? "someone";
+  const gift = input.giftName ?? "gift";
+  const to = formatGiftTarget(input.targetUsername, input.targetNickname);
+  const toPart = to ? ` to ${to}` : "";
+  return `@${sender} sent ${gift} ×${input.giftCount}${toPart}`;
 }

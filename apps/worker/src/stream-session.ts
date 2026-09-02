@@ -2,6 +2,7 @@ import {
   DEFAULT_CHAT_HIGHLIGHTS,
   DEFAULT_CHAT_KEYWORDS,
   DEFAULT_GIFT_ALERT_RULES,
+  formatGiftAlertBody,
   type ChatHighlightConfig,
   type ChatLogItem,
   type ChatUserSignals,
@@ -70,6 +71,7 @@ export class StreamSession implements DurableObject {
         gift_count INTEGER,
         diamond_value INTEGER,
         target_username TEXT,
+        target_nickname TEXT,
         alert_status TEXT NOT NULL DEFAULT 'none',
         queue_item_id TEXT,
         matched_rule TEXT,
@@ -113,6 +115,7 @@ export class StreamSession implements DurableObject {
     );
     this.ensureColumn('gift_log', 'queue_item_id', 'TEXT');
     this.ensureColumn('gift_log', 'matched_rule', 'TEXT');
+    this.ensureColumn('gift_log', 'target_nickname', 'TEXT');
     this.ensureColumn(
       'chat_log',
       'is_new_chatter',
@@ -378,6 +381,7 @@ export class StreamSession implements DurableObject {
         giftCount: event.giftCount,
         diamondValue: event.diamondValue,
         targetUsername: event.targetUsername,
+        targetNickname: event.targetNickname,
         matchedRule: matched.label,
       };
       queueItemId = await this.enqueue(
@@ -392,8 +396,8 @@ export class StreamSession implements DurableObject {
     this.ctx.storage.sql.exec(
       `INSERT INTO gift_log (
          id, stream_id, sender_username, gift_name, gift_count, diamond_value,
-         target_username, alert_status, queue_item_id, matched_rule, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         target_username, target_nickname, alert_status, queue_item_id, matched_rule, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       event.eventId,
       streamId,
       event.senderUsername,
@@ -401,6 +405,7 @@ export class StreamSession implements DurableObject {
       event.giftCount,
       event.diamondValue,
       event.targetUsername,
+      event.targetNickname,
       alertStatus,
       queueItemId,
       matchedRule,
@@ -411,7 +416,7 @@ export class StreamSession implements DurableObject {
     if (matched && queueItemId) {
       await this.pushAlert({
         title: matched.label,
-        body: `${event.senderUsername ?? 'someone'} sent ${event.giftName ?? 'gift'} ×${event.giftCount}`,
+        body: formatGiftAlertBody(event),
         tag: queueItemId,
         streamId,
         queueItemId,
@@ -621,6 +626,7 @@ export class StreamSession implements DurableObject {
         gift_count: number;
         diamond_value: number | null;
         target_username: string | null;
+        target_nickname: string | null;
         alert_status: string;
         queue_item_id: string | null;
         matched_rule: string | null;
@@ -640,6 +646,7 @@ export class StreamSession implements DurableObject {
         giftCount: r.gift_count,
         diamondValue: r.diamond_value,
         targetUsername: r.target_username,
+        targetNickname: r.target_nickname ?? null,
         alertStatus: (r.alert_status || 'none') as GiftLogItem['alertStatus'],
         queueItemId: r.queue_item_id,
         matchedRule: r.matched_rule,

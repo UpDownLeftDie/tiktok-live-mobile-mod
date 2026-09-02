@@ -81,6 +81,9 @@ connection.on(WebcastEvent.GIFT, (data) => {
     repeatCount: gift.repeatCount,
     repeatEnd: gift.repeatEnd,
     toUser: gift.toUser?.uniqueId ?? gift.toUser?.displayId ?? null,
+    toUserNickname: gift.toUser?.nickname ?? null,
+    toMemberId: gift.toMemberId ?? null,
+    toMemberNickname: gift.toMemberNickname ?? null,
     rawKeys: Object.keys(gift as object),
     raw: gift,
   });

@@ -4,12 +4,12 @@
 
 FROM node:24-alpine AS build
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@11.24.0 --activate
+RUN corepack enable && corepack prepare pnpm@11.25.0 --activate
 
-COPY package.json pnpm-workspace.yaml ./
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY packages/shared/package.json packages/shared/
 COPY apps/relay/package.json apps/relay/
-RUN pnpm install --filter @tiktok-mod/relay...
+RUN pnpm install --frozen-lockfile --filter @tiktok-mod/relay...
 
 COPY tsconfig.base.json ./
 COPY packages/shared packages/shared

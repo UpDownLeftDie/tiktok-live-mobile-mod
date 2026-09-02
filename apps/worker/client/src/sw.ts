@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { cleanupOutdatedCaches, precacheAndRoute } from "workbox-precaching";
+import { cleanupOutdatedCaches, precacheAndRoute } from 'workbox-precaching';
 
 declare let self: ServiceWorkerGlobalScope;
 
@@ -15,10 +15,10 @@ interface PushPayload {
   actions?: Array<{ action: string; title: string }>;
 }
 
-self.addEventListener("push", (event: PushEvent) => {
+self.addEventListener('push', (event: PushEvent) => {
   let data: PushPayload = {
-    title: "TikTok Live Mod",
-    body: "New alert",
+    title: 'TTMM',
+    body: 'New alert',
   };
   try {
     if (event.data) {
@@ -28,7 +28,7 @@ self.addEventListener("push", (event: PushEvent) => {
     data.body = event.data?.text() ?? data.body;
   }
 
-  const actions = data.actions ?? [{ action: "done", title: "Done" }];
+  const actions = data.actions ?? [{ action: 'done', title: 'Done' }];
 
   event.waitUntil(
     self.registration.showNotification(data.title, {
@@ -47,7 +47,7 @@ self.addEventListener("push", (event: PushEvent) => {
   );
 });
 
-self.addEventListener("notificationclick", (event: NotificationEvent) => {
+self.addEventListener('notificationclick', (event: NotificationEvent) => {
   const action = event.action;
   const data = (event.notification.data ?? {}) as {
     streamId?: string;
@@ -56,48 +56,48 @@ self.addEventListener("notificationclick", (event: NotificationEvent) => {
 
   event.notification.close();
 
-  if (action === "done" && data.streamId && data.queueItemId) {
+  if (action === 'done' && data.streamId && data.queueItemId) {
     event.waitUntil(markDone(data.streamId, data.queueItemId));
     return;
   }
 
   const targetUrl = data.streamId
     ? `/?stream=${encodeURIComponent(data.streamId)}`
-    : "/";
+    : '/';
 
   event.waitUntil(
-    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(
-      (clients) => {
+    self.clients
+      .matchAll({ type: 'window', includeUncontrolled: true })
+      .then((clients) => {
         for (const client of clients) {
-          if ("focus" in client) {
+          if ('focus' in client) {
             void client.navigate(targetUrl);
             return client.focus();
           }
         }
         return self.clients.openWindow(targetUrl);
-      },
-    ),
+      }),
   );
 });
 
 async function markDone(streamId: string, queueItemId: string): Promise<void> {
   const passcode = await getStoredPasscode();
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    'Content-Type': 'application/json',
   };
   if (passcode) {
     headers.Authorization = `Bearer ${passcode}`;
   }
   await fetch(
     `/api/streams/${encodeURIComponent(streamId)}/queue/${encodeURIComponent(queueItemId)}`,
-    { method: "PATCH", headers },
+    { method: 'PATCH', headers },
   );
 }
 
 async function getStoredPasscode(): Promise<string | null> {
   try {
-    const cache = await caches.open("mod-auth");
-    const res = await cache.match("/passcode");
+    const cache = await caches.open('mod-auth');
+    const res = await cache.match('/passcode');
     if (res) {
       const text = await res.text();
       return text || null;

@@ -1,10 +1,11 @@
-# Example Fly.io config for the relay container.
+# Fly.io config for the relay container.
 # This is ONE deploy option — not free for new Fly accounts.
 # See README for homelab / VPS alternatives.
 #
+# Deploy from the repo root (Dockerfile copies workspace files):
 #   fly apps create tiktok-mod-relay
-#   fly secrets set EULER_API_KEY=... WORKER_URL=... RELAY_SECRET=...
-#   fly deploy
+#   fly secrets set EULER_API_KEY=... RELAY_SECRET=... WORKER_URL=https://your-worker.workers.dev
+#   fly deploy . --config apps/relay/fly.toml --ha=false --no-public-ips --yes
 
 app = "tiktok-mod-relay"
 primary_region = "iad"
@@ -14,6 +15,11 @@ primary_region = "iad"
 
 [env]
   POLL_INTERVAL_MS = "5000"
+
+# No HTTP service: this process only polls the Worker and holds TikTok sockets.
+# Keep it running even with zero inbound traffic.
+[[restart]]
+  policy = "always"
 
 [[vm]]
   size = "shared-cpu-1x"

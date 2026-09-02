@@ -14,6 +14,9 @@ export type GiftEventLike = {
   repeatEnd?: number | boolean;
   user?: { uniqueId?: string; displayId?: string; nickname?: string };
   toUser?: { uniqueId?: string; displayId?: string; nickname?: string };
+  /** Guest-box recipient when the gift is aimed at a co-host / linked member. */
+  toMemberId?: string;
+  toMemberNickname?: string;
   gift?: { name?: string; diamondCount?: number; type?: number };
   giftDetails?: { giftName?: string; diamondCount?: number; giftType?: number };
   extendedGiftInfo?: { name?: string; diamond_count?: number };
@@ -96,6 +99,24 @@ export type RoomEventLike = {
 
 function usernameOf(user?: UserLike): string | null {
   return user?.uniqueId || user?.displayId || null;
+}
+
+function emptyToNull(value?: string | null): string | null {
+  return value?.trim() || null;
+}
+
+function resolveGiftTarget(data: GiftEventLike): {
+  username: string | null;
+  nickname: string | null;
+} {
+  const memberNick = emptyToNull(data.toMemberNickname);
+  if (memberNick) {
+    return { username: null, nickname: memberNick };
+  }
+  return {
+    username: usernameOf(data.toUser),
+    nickname: emptyToNull(data.toUser?.nickname),
+  };
 }
 
 function asNumber(value: string | number | null | undefined): number | null {
@@ -226,6 +247,8 @@ export function normalizeGift(
     data.extendedGiftInfo?.diamond_count ??
     null;
 
+  const target = resolveGiftTarget(data);
+
   return {
     kind: "gift",
     streamId,
@@ -235,7 +258,8 @@ export function normalizeGift(
     giftId: parseGiftId(data.giftId),
     giftCount: Number(data.repeatCount) || 1,
     diamondValue,
-    targetUsername: usernameOf(data.toUser),
+    targetUsername: target.username,
+    targetNickname: target.nickname,
     createdAt: Date.now(),
   };
 }

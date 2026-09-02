@@ -1,13 +1,14 @@
-import type {
-  ChatHighlightConfig,
-  ChatLogItem,
-  ChatUserSignals,
-  ConnectionStatus,
-  GiftAlertRule,
-  GiftLogItem,
-  LiveFeed,
-  RoomEventType,
-  RoomLogItem,
+import {
+  formatGiftTarget,
+  type ChatHighlightConfig,
+  type ChatLogItem,
+  type ChatUserSignals,
+  type ConnectionStatus,
+  type GiftAlertRule,
+  type GiftLogItem,
+  type LiveFeed,
+  type RoomEventType,
+  type RoomLogItem,
 } from '@tiktok-mod/shared';
 import {
   useCallback,
@@ -62,25 +63,23 @@ const EVENT_FILTER_TYPES: { type: RoomEventType; label: string }[] = [
   { type: 'follow', label: 'Follows' },
   { type: 'share', label: 'Shares' },
   { type: 'subscribe', label: 'Subs' },
-  { type: 'like', label: 'Likes' },
-  { type: 'stream_end', label: 'End' },
-  { type: 'other', label: 'Other' },
 ];
 
 const EVENT_FILTER_KEY = (streamId: string) =>
   `live-mod:event-filters:${streamId}`;
 
 function defaultEventFilters(): Set<RoomEventType> {
-  return new Set(
-    EVENT_FILTER_TYPES.map((t) => t.type).filter((t) => t !== 'like'),
-  );
+  return new Set(EVENT_FILTER_TYPES.map((t) => t.type));
 }
 
 function loadEventFilters(streamId: string): Set<RoomEventType> {
+  const allowed = new Set(EVENT_FILTER_TYPES.map((t) => t.type));
   try {
     const raw = localStorage.getItem(EVENT_FILTER_KEY(streamId));
     if (!raw) return defaultEventFilters();
-    return new Set(JSON.parse(raw) as RoomEventType[]);
+    return new Set(
+      (JSON.parse(raw) as RoomEventType[]).filter((t) => allowed.has(t)),
+    );
   } catch {
     return defaultEventFilters();
   }
@@ -154,7 +153,7 @@ export function App() {
         <header className="header">
           <div>
             <p className="brand">Live Mod</p>
-            <p className="sub">TikTok LIVE alerts — phone-first</p>
+            <p className="sub">TTMM - TikTok Mobile Mod</p>
           </div>
         </header>
         <div className="banner error">{boot.message}</div>
@@ -583,8 +582,8 @@ function LivePanel(
   }
 
   const highlights = props.feed.chatHighlights ?? DEFAULT_CHAT_HIGHLIGHTS;
-  const filteredEvents = props.feed.events.filter((e) =>
-    eventFilters.has(e.type),
+  const filteredEvents = props.feed.events.filter(
+    (e) => e.type === 'stream_end' || eventFilters.has(e.type),
   );
 
   return (
@@ -596,6 +595,7 @@ function LivePanel(
           empty="No gifts yet.">
           <GiftList
             items={props.feed.gifts}
+            hostUsername={props.selected}
             busy={props.busy}
             onDone={props.onGiftDone}
             onUndo={props.onGiftUndo}
@@ -754,16 +754,18 @@ function ChatList(
   );
 }
 
-function ChatSignalTags(
-  props: Readonly<{ signals: ChatUserSignals | null }>,
-) {
+function ChatSignalTags(props: Readonly<{ signals: ChatUserSignals | null }>) {
   const s = props.signals;
   if (!s) return null;
   const tags: { key: string; label: string; className: string }[] = [];
-  if (s.isModerator) tags.push({ key: 'mod', label: 'mod', className: 'tag-mod' });
-  if (s.isSubscriber) tags.push({ key: 'sub', label: 'sub', className: 'tag-sub' });
-  if (s.isFollower) tags.push({ key: 'fol', label: 'follow', className: 'tag-follow' });
-  if (s.isGiftGiver) tags.push({ key: 'gg', label: 'gifter', className: 'tag-gift' });
+  if (s.isModerator)
+    tags.push({ key: 'mod', label: 'mod', className: 'tag-mod' });
+  if (s.isSubscriber)
+    tags.push({ key: 'sub', label: 'sub', className: 'tag-sub' });
+  if (s.isFollower)
+    tags.push({ key: 'fol', label: 'follow', className: 'tag-follow' });
+  if (s.isGiftGiver)
+    tags.push({ key: 'gg', label: 'gifter', className: 'tag-gift' });
   if (s.fansClubName) {
     tags.push({
       key: 'fans',
@@ -820,6 +822,7 @@ function EventList(props: Readonly<{ items: RoomLogItem[] }>) {
 function GiftList(
   props: Readonly<{
     items: GiftLogItem[];
+    hostUsername: string | null;
     busy: boolean;
     onDone: (giftId: string) => void;
     onUndo: (giftId: string) => void;
@@ -834,10 +837,20 @@ function GiftList(
         const pending = item.alertStatus !== 'done';
         const done = item.alertStatus === 'done';
         const isAlert = Boolean(item.matchedRule) && pending;
+        const target = item.targetUsername;
+        const host = props.hostUsername;
+        const toGuest =
+          target != null &&
+          host != null &&
+          target.toLowerCase() !== host.toLowerCase();
+        const targetLabel = formatGiftTarget(
+          item.targetUsername,
+          item.targetNickname,
+        );
         return (
           <div
             key={item.id}
-            className={`feed-line gift-line ${isAlert ? 'alert' : ''} ${done ? 'faded' : ''}`}>
+            className={`feed-line gift-line ${isAlert ? 'alert' : ''} ${done ? 'faded' : ''} ${toGuest ? 'gift-to-guest' : ''}`}>
             <FeedTime at={item.createdAt} />
             <div className="feed-line-main">
               <span className="chat-user">
@@ -845,6 +858,17 @@ function GiftList(
               </span>
               <span className="chat-body">
                 sent {item.giftName ?? 'gift'} ×{item.giftCount}
+                {targetLabel ? (
+                  <>
+                    {' '}
+                    to{' '}
+                    <span
+                      className={toGuest ? 'gift-target guest' : 'gift-target'}>
+                      {targetLabel}
+                    </span>
+                  </>
+                ) : null}
+                {toGuest ? <span className="tag tag-guest"> guest</span> : null}
                 {item.diamondValue != null ? (
                   <span className="muted"> · {item.diamondValue}◆</span>
                 ) : null}
@@ -1193,7 +1217,10 @@ function SettingsPanel(
           <button type="button" onClick={props.onEnablePush}>
             Enable push
           </button>
-          <button type="button" disabled={props.busy} onClick={props.onTestPush}>
+          <button
+            type="button"
+            disabled={props.busy}
+            onClick={props.onTestPush}>
             Send test
           </button>
         </div>

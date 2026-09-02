@@ -369,6 +369,21 @@ textarea {
   color: #e8a0ff;
 }
 
+.gift-target {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.gift-target.guest,
+.tag-guest {
+  color: #7ee0c8;
+}
+
+.feed-line.gift-to-guest:not(.faded) {
+  border-left: 3px solid #7ee0c8;
+  padding-left: 0.45rem;
+}
+
 .event-type {
   display: inline-block;
   min-width: 4.2rem;
