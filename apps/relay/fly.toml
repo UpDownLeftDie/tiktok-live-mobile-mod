@@ -1,0 +1,20 @@
+# Example Fly.io config for the relay container.
+# This is ONE deploy option — not free for new Fly accounts.
+# See README for homelab / VPS alternatives.
+#
+#   fly apps create tiktok-mod-relay
+#   fly secrets set EULER_API_KEY=... WORKER_URL=... RELAY_SECRET=...
+#   fly deploy
+
+app = "tiktok-mod-relay"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  POLL_INTERVAL_MS = "5000"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

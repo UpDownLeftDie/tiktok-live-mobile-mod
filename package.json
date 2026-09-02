@@ -1,0 +1,27 @@
+{
+  "name": "tiktok-live-mobile-mod",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "eslint . && pnpm -r typecheck",
+    "lint:fix": "eslint . --fix && pnpm -r typecheck",
+    "typecheck": "pnpm -r typecheck",
+    "dev:relay": "pnpm --filter @tiktok-mod/relay dev",
+    "dev:spike": "pnpm --filter @tiktok-mod/relay spike",
+    "dev:worker": "pnpm --filter @tiktok-mod/worker dev",
+    "build": "pnpm --filter @tiktok-mod/shared build && pnpm --filter @tiktok-mod/relay build && pnpm --filter @tiktok-mod/worker build",
+    "build:relay": "pnpm --filter @tiktok-mod/relay build",
+    "build:worker": "pnpm --filter @tiktok-mod/worker build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "eslint-plugin-sonarjs": "^4.2.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.69.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.25.0"
+}

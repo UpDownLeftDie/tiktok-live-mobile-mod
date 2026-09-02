@@ -1,0 +1,7 @@
+# Worker local secrets example — copy to apps/worker/.dev.vars
+RELAY_SECRET=dev-relay-secret-change-me
+MOD_PASSCODE=dev-passcode
+# Generate with: npx @pushforge/builder vapid
+# VAPID_PUBLIC_KEY=...
+# VAPID_PRIVATE_KEY={"kty":"EC",...}
+# VAPID_SUBJECT=mailto:you@example.com

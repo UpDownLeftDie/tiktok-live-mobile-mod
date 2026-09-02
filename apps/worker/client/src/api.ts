@@ -1,0 +1,197 @@
+import type {
+  ChatHighlightConfig,
+  ConnectionStatus,
+  LiveFeed,
+  StreamConfig,
+} from '@tiktok-mod/shared';
+
+export type PublicConfig = {
+  vapidPublicKey: string | null;
+  passcodeRequired: boolean;
+};
+
+const PASSCODE_KEY = 'mod_passcode';
+
+export function getPasscode(): string {
+  return localStorage.getItem(PASSCODE_KEY) ?? '';
+}
+
+export function setPasscode(value: string): void {
+  localStorage.setItem(PASSCODE_KEY, value);
+  void syncPasscodeToCache(value);
+}
+
+async function syncPasscodeToCache(value: string): Promise<void> {
+  try {
+    const cache = await caches.open('mod-auth');
+    await cache.put('/passcode', new Response(value));
+  } catch {
+    // ignore
+  }
+}
+
+export function authHeaders(): HeadersInit {
+  const passcode = getPasscode();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (passcode) {
+    headers.Authorization = `Bearer ${passcode}`;
+  }
+  return headers;
+}
+
+function requestHeaders(extra?: HeadersInit): Headers {
+  const headers = new Headers(authHeaders());
+  if (!extra) return headers;
+  new Headers(extra).forEach((value, key) => {
+    headers.set(key, value);
+  });
+  return headers;
+}
+
+async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    ...init,
+    headers: requestHeaders(init?.headers),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status}: ${text}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export function fetchPublicConfig(): Promise<PublicConfig> {
+  return fetch('/api/public-config').then(
+    (r) => r.json() as Promise<PublicConfig>,
+  );
+}
+
+export function listStreams(): Promise<{
+  streams: Array<{ streamId: string; addedAt: number; isCheckedIn: boolean }>;
+}> {
+  return api('/api/streams');
+}
+
+export function addStream(streamId: string): Promise<{ streamId: string }> {
+  return api('/api/streams', {
+    method: 'POST',
+    body: JSON.stringify({ streamId }),
+  });
+}
+
+export function removeStream(streamId: string): Promise<unknown> {
+  return api(`/api/streams/${encodeURIComponent(streamId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export function checkIn(streamId: string): Promise<unknown> {
+  return api(`/api/streams/${encodeURIComponent(streamId)}/check-in`, {
+    method: 'POST',
+  });
+}
+
+export function checkOut(streamId: string): Promise<unknown> {
+  return api(`/api/streams/${encodeURIComponent(streamId)}/check-out`, {
+    method: 'POST',
+  });
+}
+
+export function getLiveFeed(streamId: string): Promise<LiveFeed> {
+  return api(`/api/streams/${encodeURIComponent(streamId)}/live`);
+}
+
+export function markDone(streamId: string, itemId: string): Promise<unknown> {
+  return api(
+    `/api/streams/${encodeURIComponent(streamId)}/queue/${encodeURIComponent(itemId)}`,
+    { method: 'PATCH' },
+  );
+}
+
+export function markGiftDone(
+  streamId: string,
+  giftId: string,
+): Promise<unknown> {
+  return setGiftStatus(streamId, giftId, 'done');
+}
+
+export function markGiftPending(
+  streamId: string,
+  giftId: string,
+): Promise<unknown> {
+  return setGiftStatus(streamId, giftId, 'pending');
+}
+
+function setGiftStatus(
+  streamId: string,
+  giftId: string,
+  status: 'done' | 'pending',
+): Promise<unknown> {
+  return api(
+    `/api/streams/${encodeURIComponent(streamId)}/gifts/${encodeURIComponent(giftId)}`,
+    { method: 'PATCH', body: JSON.stringify({ status }) },
+  );
+}
+
+export function getConfig(streamId: string): Promise<StreamConfig> {
+  return api(`/api/streams/${encodeURIComponent(streamId)}/config`);
+}
+
+export function putConfig(
+  streamId: string,
+  body: {
+    giftAlertRules?: StreamConfig['giftAlertRules'];
+    chatKeywordFlags?: string[];
+    chatHighlights?: ChatHighlightConfig;
+  },
+): Promise<StreamConfig> {
+  return api(`/api/streams/${encodeURIComponent(streamId)}/config`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+export function subscribePush(
+  subscription: PushSubscriptionJSON,
+): Promise<unknown> {
+  return api('/api/subscribe', {
+    method: 'POST',
+    body: JSON.stringify(subscription),
+  });
+}
+
+export function testPush(): Promise<unknown> {
+  return api('/api/test-push', { method: 'POST' });
+}
+
+export function urlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding)
+    .replaceAll('-', '+')
+    .replaceAll('_', '/');
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) {
+    out[i] = raw.codePointAt(i) ?? 0;
+  }
+  return out;
+}
+
+export function statusLabel(status: ConnectionStatus): string {
+  switch (status) {
+    case 'live':
+      return 'Live';
+    case 'waiting':
+      return 'Connecting';
+    case 'offline':
+      return 'Offline';
+    case 'disconnected':
+      return 'Disconnected';
+    default:
+      return 'Idle';
+  }
+}
+
+export { DEFAULT_CHAT_HIGHLIGHTS } from '@tiktok-mod/shared';

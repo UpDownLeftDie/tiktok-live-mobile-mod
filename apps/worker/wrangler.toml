@@ -1,0 +1,35 @@
+name = "tiktok-live-mod"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./client/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+# Send API traffic to the Worker before the static-asset router.
+# Without this, wrangler 4.x can treat an aborted POST body as fatal and exit
+# with an empty `✘ [ERROR]` (cloudflare/workers-sdk#15203).
+run_worker_first = ["/api/*"]
+
+[[durable_objects.bindings]]
+name = "STREAM_SESSION"
+class_name = "StreamSession"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StreamSession", "Registry"]
+
+[vars]
+# Public VAPID key is safe to expose; set real value via wrangler.toml or dashboard.
+# VAPID_PUBLIC_KEY = "..."
+
+# Secrets (wrangler secret put):
+#   RELAY_SECRET
+#   MOD_PASSCODE
+#   VAPID_PRIVATE_KEY
+#   VAPID_SUBJECT   (e.g. mailto:you@example.com)
