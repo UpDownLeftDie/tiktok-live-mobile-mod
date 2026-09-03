@@ -1,7 +1,9 @@
 import type {
   CheckedInStream,
+  GiftCatalogItem,
   PushNotificationPayload,
 } from '@tiktok-mod/shared';
+import { dedupeGiftCatalogByName, GIFT_CATALOG } from '@tiktok-mod/shared';
 import type { Env } from './env';
 import { sendWebPush, type StoredSubscription } from './push';
 
@@ -43,6 +45,11 @@ export class Registry implements DurableObject {
         auth TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS gift_catalog (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        gifts_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
   }
 
@@ -70,6 +77,10 @@ export class Registry implements DurableObject {
         return this.push(request);
       case 'POST /test-push':
         return this.testPush();
+      case 'GET /gift-catalog':
+        return this.getGiftCatalog();
+      case 'PUT /gift-catalog':
+        return this.putGiftCatalog(request);
       default:
         break;
     }
@@ -214,6 +225,57 @@ export class Registry implements DurableObject {
       actions: [{ action: 'done', title: 'Done' }],
     });
     return Response.json({ ok: true, results });
+  }
+
+  private getGiftCatalog(): Response {
+    const row = this.ctx.storage.sql
+      .exec<{ gifts_json: string; updated_at: number }>(
+        'SELECT gifts_json, updated_at FROM gift_catalog WHERE id = 1',
+      )
+      .toArray()[0];
+    if (!row) {
+      return Response.json({
+        gifts: GIFT_CATALOG,
+        updatedAt: null,
+        source: 'bundled',
+      });
+    }
+    try {
+      const gifts = JSON.parse(row.gifts_json) as GiftCatalogItem[];
+      if (!Array.isArray(gifts) || gifts.length === 0) {
+        return Response.json({
+          gifts: GIFT_CATALOG,
+          updatedAt: null,
+          source: 'bundled',
+        });
+      }
+      return Response.json({
+        gifts: dedupeGiftCatalogByName(gifts),
+        updatedAt: row.updated_at,
+        source: 'synced',
+      });
+    } catch {
+      return Response.json({
+        gifts: GIFT_CATALOG,
+        updatedAt: null,
+        source: 'bundled',
+      });
+    }
+  }
+
+  private async putGiftCatalog(request: Request): Promise<Response> {
+    const body = (await request.json()) as { gifts?: GiftCatalogItem[] };
+    const gifts = dedupeGiftCatalogByName(
+      Array.isArray(body.gifts) ? body.gifts : [],
+    );
+    this.ctx.storage.sql.exec(
+      `INSERT INTO gift_catalog (id, gifts_json, updated_at) VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET gifts_json = excluded.gifts_json,
+         updated_at = excluded.updated_at`,
+      JSON.stringify(gifts),
+      Date.now(),
+    );
+    return Response.json({ ok: true, count: gifts.length });
   }
 
   private listSubscriptions(): StoredSubscription[] {

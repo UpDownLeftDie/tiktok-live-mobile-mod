@@ -100,8 +100,14 @@ TikTok Webcast gift events include a `toUser` field, but it typically refers to 
 
 ## Alert rules (v1)
 
-- Gift ≥ configured diamond threshold (default 100), or named gift allowlist
+- Gift ≥ configured diamond threshold (default 100), with an independent notify toggle
+- Named gifts picked from the TikTok gift catalog (bundled + relay-refreshed), with an independent notify toggle
+- Live Gifts feed hides gifts below a local diamond floor; enabled gift types appear as filter pills (OR with the floor)
 - Case-insensitive chat keyword substrings
+
+Gift catalog:
+- Bundled live-panel snapshot (`source=1` from antiops, ~800 gifts) for instant use
+- Relay refreshes that same live-panel set from [antiops/tiktok-trending-data](https://github.com/antiops/tiktok-trending-data/blob/main/live-gift-details.json) on startup and every `GIFT_CATALOG_SYNC_MS` (default 6h)
 
 Out of scope: guest-box automation, sending chat, muting/kicking, multi-tenant auth, past-events stats UI.
 

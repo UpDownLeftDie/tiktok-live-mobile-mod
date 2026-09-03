@@ -1,4 +1,8 @@
-import type { CheckedInStream, RelayEvent } from '@tiktok-mod/shared';
+import type {
+  CheckedInStream,
+  GiftCatalogItem,
+  RelayEvent,
+} from '@tiktok-mod/shared';
 
 export class WorkerClient {
   constructor(
@@ -25,6 +29,19 @@ export class WorkerClient {
     }
     const body = (await res.json()) as { streams: CheckedInStream[] };
     return body.streams;
+  }
+
+  async putGiftCatalog(gifts: GiftCatalogItem[]): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/gift-catalog`, {
+      method: 'PUT',
+      headers: this.headers(true),
+      body: JSON.stringify({ gifts }),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `gift catalog put failed: ${res.status} ${await res.text()}`,
+      );
+    }
   }
 
   async postEvent(streamId: string, event: RelayEvent): Promise<void> {

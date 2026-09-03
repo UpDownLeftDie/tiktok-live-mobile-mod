@@ -104,12 +104,15 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+  min-width: 0;
 }
 
 .feed-col {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .feed-col-header {
@@ -118,12 +121,34 @@ textarea {
   align-items: center;
   gap: 0.45rem 0.65rem;
   margin-bottom: 0.45rem;
+  min-width: 0;
 }
 
-.feed-events .feed-col-header {
+.feed-events .feed-col-header,
+.feed-chat .feed-col-header {
   flex-direction: column;
   align-items: stretch;
   gap: 0.4rem;
+}
+
+.feed-primary .feed-col-header {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 0.4rem 0.65rem;
+}
+
+.feed-primary .gift-filters {
+  display: contents;
+}
+
+.feed-primary .gift-min-diamonds {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.feed-primary .pill-row {
+  grid-column: 1 / -1;
 }
 
 .feed-col-header h2 {
@@ -142,17 +167,10 @@ textarea {
 
 .pill-row {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 0.35rem;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: none;
-  padding-bottom: 0.1rem;
-}
-
-.pill-row::-webkit-scrollbar {
-  display: none;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .pill {
@@ -173,35 +191,68 @@ textarea {
   font-weight: 600;
 }
 
+.gift-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.gift-min-diamonds {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.gift-min-diamonds input {
+  width: 4.75rem;
+  padding: 0.28rem 0.45rem;
+  font-size: 0.75rem;
+}
+
 .feed-scroll {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: color-mix(in srgb, var(--bg-elev) 80%, black);
-  overflow: hidden;
-  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: min(32dvh, 280px);
 }
 
 .feed-primary .feed-scroll {
-  max-height: min(42dvh, 360px);
+  max-height: min(40dvh, 340px);
   border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
 }
 
 .feed-chat .feed-scroll {
-  max-height: min(28dvh, 260px);
+  max-height: min(32dvh, 280px);
 }
 
 .feed-events .feed-scroll {
-  max-height: min(18dvh, 180px);
+  max-height: min(22dvh, 200px);
 }
 
 .feed-inner {
-  max-height: inherit;
-  height: 100%;
-  overflow-y: auto;
   padding: 0.55rem 0.65rem;
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
+}
+
+.gift-done-all {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.35rem;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  margin: -0.55rem -0.65rem 0.05rem;
+  padding: 0.4rem 0.65rem 0.35rem;
+  background: color-mix(in srgb, var(--bg-elev) 80%, black);
 }
 
 .feed-empty {
@@ -286,6 +337,31 @@ textarea {
   border-left-color: #e8a0ff;
 }
 
+.gift-line.hl-enabled:not(.faded) {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 6px;
+  padding: 0.2rem 0.35rem;
+}
+
+.gift-line.hl-enabled.alert:not(.faded) {
+  padding-left: 0.45rem;
+}
+
+.gift-name {
+  color: #e8a0ff;
+  font-weight: 650;
+}
+
+.gift-name.important {
+  color: #ffd28a;
+  font-weight: 700;
+}
+
+.gift-spend {
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
 .feed-line-main {
   min-width: 0;
   flex: 1;
@@ -349,7 +425,7 @@ textarea {
 .chat-body {
   color: var(--text);
   font-weight: 400;
-  word-break: break-word;
+  word-break: word-break;
 }
 
 .done-label {
@@ -403,6 +479,79 @@ button.tiny {
   font-weight: 650;
 }
 
+.switch-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.switch {
+  position: relative;
+  width: 2.75rem;
+  height: 1.55rem;
+  flex-shrink: 0;
+}
+
+.switch input {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  cursor: pointer;
+  border: 0;
+  background: transparent;
+}
+
+.switch-ui {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  background: #3a4152;
+  pointer-events: none;
+  transition: background 0.15s ease;
+}
+
+.switch-ui::after {
+  content: '';
+  position: absolute;
+  top: 0.18rem;
+  left: 0.18rem;
+  width: 1.2rem;
+  height: 1.2rem;
+  border-radius: 50%;
+  background: var(--text);
+  transition: transform 0.15s ease;
+}
+
+.switch input:checked + .switch-ui {
+  background: var(--accent);
+}
+
+.switch input:checked + .switch-ui::after {
+  transform: translateX(1.18rem);
+  background: #06221f;
+}
+
+.switch input:focus-visible + .switch-ui {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.settings-block {
+  margin-bottom: 0.25rem;
+}
+
+.field.nested {
+  margin-top: -0.25rem;
+}
+
 .check-field {
   display: flex;
   align-items: flex-start;
@@ -415,6 +564,34 @@ button.tiny {
   margin-top: 0.2rem;
 }
 
+.gift-picker {
+  max-height: 14rem;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.55rem;
+  margin-top: 0.4rem;
+}
+
+.field input[type='search'] {
+  width: 100%;
+  margin-top: 0.4rem;
+}
+
+.gift-picker-item {
+  margin-bottom: 0.35rem;
+  align-items: center;
+}
+
+.gift-picker-search {
+  margin-top: 0.55rem;
+  border-style: dashed;
+}
+
+.gift-picker-item .muted {
+  margin-left: auto;
+}
+
 .field.grow {
   flex: 1;
   min-width: 0;
@@ -423,14 +600,16 @@ button.tiny {
 @media (min-width: 800px) {
   .live-layout {
     display: grid;
-    grid-template-columns: 1.35fr 1fr;
+    grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
     gap: 0.85rem;
     align-items: stretch;
-    min-height: min(70dvh, 640px);
+    height: min(calc(100dvh - 13rem), 640px);
+    max-height: min(calc(100dvh - 13rem), 640px);
   }
 
   .live-secondary {
     min-height: 0;
+    overflow: hidden;
   }
 
   .feed-primary,
@@ -438,29 +617,28 @@ button.tiny {
     display: flex;
     flex-direction: column;
     min-height: 0;
+    min-width: 0;
+    overflow: hidden;
   }
 
-  .feed-primary .feed-scroll {
+  .feed-primary .feed-scroll,
+  .feed-chat .feed-scroll,
+  .feed-events .feed-scroll {
     max-height: none;
-    flex: 1;
+    flex: 1 1 0;
+    min-height: 0;
   }
 
   .feed-chat {
     flex: 1.35;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .feed-events {
     flex: 0.85;
-  }
-
-  .feed-chat .feed-scroll,
-  .feed-events .feed-scroll {
-    max-height: none;
-    flex: 1;
-  }
-
-  .feed-inner {
-    max-height: none;
+    min-height: 0;
+    overflow: hidden;
   }
 }
 

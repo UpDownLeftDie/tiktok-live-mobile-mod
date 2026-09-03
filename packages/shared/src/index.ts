@@ -23,11 +23,22 @@ export type RoomEventType =
 export interface GiftAlertRule {
   /** Match a specific gift name (case-insensitive). */
   giftName?: string;
-  /** Alert when diamond/coin value is >= this (per single gift unit). */
+  /** Alert when total diamonds spent (unit × count) is >= this. */
   minDiamondValue?: number;
   /** Short label shown in the queue / notification. */
   label: string;
+  /**
+   * When false, the rule is kept for feed pills / settings but does not
+   * enqueue or push. Omitted / true = notify (backward compatible).
+   */
+  notify?: boolean;
 }
+
+export type { GiftCatalogItem } from "./gift-catalog.js";
+export {
+  GIFT_CATALOG,
+  dedupeGiftCatalogByName,
+} from "./gift-catalog.js";
 
 export interface ChatHighlightConfig {
   /** Usernames (uniqueId) always highlighted in chat. */
@@ -201,6 +212,8 @@ export interface LiveFeed {
   statusDetail: string | null;
   isCheckedIn: boolean;
   chatHighlights: ChatHighlightConfig;
+  /** Gift names enabled in stream settings (feed pills), regardless of notify. */
+  enabledGiftNames: string[];
   chat: ChatLogItem[];
   events: RoomLogItem[];
   gifts: GiftLogItem[];
@@ -220,6 +233,16 @@ export interface PushNotificationPayload {
   actions?: Array<{ action: string; title: string }>;
 }
 
+/** Total diamonds spent for a gift event (unit value × combo/repeat count). */
+export function giftDiamondSpend(
+  diamondValue: number | null | undefined,
+  giftCount: number | null | undefined,
+): number {
+  if (typeof diamondValue !== "number") return 0;
+  const count = giftCount && giftCount > 0 ? giftCount : 1;
+  return diamondValue * count;
+}
+
 export function formatGiftTarget(
   username: string | null | undefined,
   nickname?: string | null,
@@ -237,6 +260,7 @@ export function formatGiftAlertBody(input: {
   senderUsername: string | null;
   giftName: string | null;
   giftCount: number;
+  diamondValue?: number | null;
   targetUsername: string | null;
   targetNickname?: string | null;
 }): string {
@@ -244,5 +268,8 @@ export function formatGiftAlertBody(input: {
   const gift = input.giftName ?? "gift";
   const to = formatGiftTarget(input.targetUsername, input.targetNickname);
   const toPart = to ? ` to ${to}` : "";
-  return `@${sender} sent ${gift} ×${input.giftCount}${toPart}`;
+  const spend = giftDiamondSpend(input.diamondValue, input.giftCount);
+  const valuePart =
+    typeof input.diamondValue === "number" ? ` ${spend}◆` : ` ×${input.giftCount}`;
+  return `@${sender} sent ${gift}${valuePart}${toPart}`;
 }

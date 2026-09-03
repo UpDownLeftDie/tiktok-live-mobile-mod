@@ -3,6 +3,7 @@ import {
   DEFAULT_CHAT_KEYWORDS,
   DEFAULT_GIFT_ALERT_RULES,
   formatGiftAlertBody,
+  giftDiamondSpend,
   type ChatHighlightConfig,
   type ChatLogItem,
   type ChatUserSignals,
@@ -250,6 +251,8 @@ export class StreamSession implements DurableObject {
         return Response.json(this.getConfig(streamId));
       case 'PUT /config':
         return this.handlePutConfig(streamId, await request.json());
+      case 'PATCH /gifts':
+        return this.handleSetGiftStatuses(streamId, await request.json());
       default:
         break;
     }
@@ -550,8 +553,10 @@ export class StreamSession implements DurableObject {
         connection_status: string;
         connection_detail: string | null;
         chat_highlights: string | null;
+        gift_alert_rules: string;
       }>(
-        `SELECT is_checked_in, connection_status, connection_detail, chat_highlights
+        `SELECT is_checked_in, connection_status, connection_detail,
+                chat_highlights, gift_alert_rules
          FROM stream_config WHERE stream_id = ?`,
         streamId,
       )
@@ -659,6 +664,7 @@ export class StreamSession implements DurableObject {
       statusDetail: cfg.connection_detail,
       isCheckedIn: cfg.is_checked_in === 1,
       chatHighlights: this.parseHighlights(cfg.chat_highlights),
+      enabledGiftNames: enabledGiftNamesFromRules(cfg.gift_alert_rules),
       chat,
       events,
       gifts,
@@ -728,6 +734,24 @@ export class StreamSession implements DurableObject {
       streamId,
     );
     return Response.json({ ok: true, id: itemId, status: 'done' });
+  }
+
+  private handleSetGiftStatuses(streamId: string, body: unknown): Response {
+    const status =
+      body &&
+      typeof body === 'object' &&
+      'status' in body &&
+      ((body as { status?: string }).status === 'pending' ||
+        (body as { status?: string }).status === 'done')
+        ? (body as { status: 'pending' | 'done' }).status
+        : 'done';
+    const ids = parseGiftIdList(body);
+    let count = 0;
+    for (const id of ids) {
+      const res = this.handleSetGiftStatus(streamId, id, { status });
+      if (res.ok) count += 1;
+    }
+    return Response.json({ ok: true, count, status });
   }
 
   private handleSetGiftStatus(
@@ -850,11 +874,55 @@ function parseUserSignals(raw: string | null): ChatUserSignals | null {
   }
 }
 
+export function enabledGiftNamesFromRules(
+  raw: string | GiftAlertRule[],
+): string[] {
+  let rules: GiftAlertRule[];
+  if (typeof raw === 'string') {
+    try {
+      rules = JSON.parse(raw) as GiftAlertRule[];
+    } catch {
+      return [];
+    }
+  } else {
+    rules = raw;
+  }
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const rule of rules) {
+    const name = rule.giftName?.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    names.push(name);
+  }
+  return names;
+}
+
+function parseGiftIdList(body: unknown): string[] {
+  if (!body || typeof body !== 'object' || !('ids' in body)) return [];
+  const raw = (body as { ids?: unknown }).ids;
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const value of raw) {
+    if (typeof value !== 'string') continue;
+    const id = value.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= GIFT_LIMIT) break;
+  }
+  return ids;
+}
+
 export function matchGiftRule(
   rules: GiftAlertRule[],
   event: RelayGiftEvent,
 ): GiftAlertRule | null {
   for (const rule of rules) {
+    if (rule.notify === false) continue;
     if (rule.giftName) {
       if (event.giftName?.toLowerCase() === rule.giftName.toLowerCase()) {
         return rule;
@@ -863,8 +931,8 @@ export function matchGiftRule(
     }
     if (
       typeof rule.minDiamondValue === 'number' &&
-      typeof event.diamondValue === 'number' &&
-      event.diamondValue >= rule.minDiamondValue
+      giftDiamondSpend(event.diamondValue, event.giftCount) >=
+        rule.minDiamondValue
     ) {
       return rule;
     }

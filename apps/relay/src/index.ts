@@ -1,6 +1,7 @@
-import { loadRepoEnv } from "./load-env.js";
-import { StreamWatcher } from "./stream-watcher.js";
-import { WorkerClient } from "./worker-client.js";
+import { fetchRemoteGiftCatalog } from './gift-catalog.js';
+import { loadRepoEnv } from './load-env.js';
+import { StreamWatcher } from './stream-watcher.js';
+import { WorkerClient } from './worker-client.js';
 
 loadRepoEnv();
 
@@ -13,13 +14,27 @@ function requireEnv(name: string): string {
   return value;
 }
 
-const eulerApiKey = requireEnv("EULER_API_KEY");
-const workerUrl = requireEnv("WORKER_URL").replace(/\/$/, "");
-const relaySecret = requireEnv("RELAY_SECRET");
-const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS ?? "5000");
+const eulerApiKey = requireEnv('EULER_API_KEY');
+const workerUrl = requireEnv('WORKER_URL').replace(/\/$/, '');
+const relaySecret = requireEnv('RELAY_SECRET');
+const pollIntervalMs = Number(process.env.POLL_INTERVAL_MS ?? '5000');
+const catalogSyncMs = Number(
+  process.env.GIFT_CATALOG_SYNC_MS ?? String(6 * 60 * 60 * 1000),
+);
 
 const worker = new WorkerClient(workerUrl, relaySecret);
 const watchers = new Map<string, StreamWatcher>();
+let lastCatalogSync = 0;
+
+async function syncGiftCatalog(): Promise<void> {
+  if (lastCatalogSync > 0 && Date.now() - lastCatalogSync < catalogSyncMs) {
+    return;
+  }
+  const gifts = await fetchRemoteGiftCatalog();
+  await worker.putGiftCatalog(gifts);
+  lastCatalogSync = Date.now();
+  console.log(`[relay] gift catalog synced (${gifts.length} types)`);
+}
 
 async function syncWatchers(): Promise<void> {
   const streams = await worker.getCheckedIn();
@@ -45,8 +60,8 @@ async function syncWatchers(): Promise<void> {
   }
 }
 
-process.on("SIGINT", () => {
-  console.log("[relay] SIGINT, shutting down…");
+process.on('SIGINT', () => {
+  console.log('[relay] SIGINT, shutting down…');
   void Promise.all([...watchers.values()].map((w) => w.stop())).then(() =>
     process.exit(0),
   );
@@ -55,9 +70,14 @@ process.on("SIGINT", () => {
 console.log(`[relay] starting; worker=${workerUrl} poll=${pollIntervalMs}ms`);
 for (;;) {
   try {
+    await syncGiftCatalog();
+  } catch (err) {
+    console.error('[relay] gift catalog sync failed', err);
+  }
+  try {
     await syncWatchers();
   } catch (err) {
-    console.error("[relay] poll failed", err);
+    console.error('[relay] poll failed', err);
   }
   await new Promise((r) => setTimeout(r, pollIntervalMs));
 }

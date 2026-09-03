@@ -1,10 +1,13 @@
 import {
   formatGiftTarget,
+  dedupeGiftCatalogByName,
+  giftDiamondSpend,
   type ChatHighlightConfig,
   type ChatLogItem,
   type ChatUserSignals,
   type ConnectionStatus,
   type GiftAlertRule,
+  type GiftCatalogItem,
   type GiftLogItem,
   type LiveFeed,
   type RoomEventType,
@@ -25,12 +28,15 @@ import {
   DEFAULT_CHAT_HIGHLIGHTS,
   fetchPublicConfig,
   getConfig,
+  getGiftCatalog,
   getLiveFeed,
   getPasscode,
   listStreams,
   markDone,
   markGiftDone,
   markGiftPending,
+  markGiftsDone,
+  markGiftsPending,
   putConfig,
   removeStream,
   setPasscode,
@@ -89,12 +95,148 @@ function saveEventFilters(streamId: string, types: Set<RoomEventType>) {
   localStorage.setItem(EVENT_FILTER_KEY(streamId), JSON.stringify([...types]));
 }
 
+const GIFT_MIN_DIAMONDS_KEY = (streamId: string) =>
+  `live-mod:gift-min-diamonds:${streamId}`;
+
+const GIFT_TYPE_FILTER_KEY = (streamId: string) =>
+  `live-mod:gift-type-filters:${streamId}`;
+
+function loadGiftMinDiamonds(streamId: string): number {
+  try {
+    const raw = localStorage.getItem(GIFT_MIN_DIAMONDS_KEY(streamId));
+    if (raw == null || raw === '') return 0;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveGiftMinDiamonds(streamId: string, value: number) {
+  localStorage.setItem(GIFT_MIN_DIAMONDS_KEY(streamId), String(value));
+}
+
+function loadGiftTypeFilters(
+  streamId: string,
+  enabledNames: string[],
+): Set<string> {
+  const allowed = enabledNames.map((n) => n.toLowerCase());
+  try {
+    const raw = localStorage.getItem(GIFT_TYPE_FILTER_KEY(streamId));
+    if (!raw) return new Set(allowed);
+    const parsed = JSON.parse(raw) as
+      | string[]
+      | { on?: string[]; known?: string[] };
+    if (Array.isArray(parsed)) {
+      const saved = new Set(parsed.map((n) => n.toLowerCase()));
+      return new Set(allowed.filter((n) => saved.has(n)));
+    }
+    const on = new Set((parsed.on ?? []).map((n) => n.toLowerCase()));
+    const known = new Set((parsed.known ?? []).map((n) => n.toLowerCase()));
+    return new Set(allowed.filter((n) => on.has(n) || !known.has(n)));
+  } catch {
+    return new Set(allowed);
+  }
+}
+
+function saveGiftTypeFilters(
+  streamId: string,
+  types: Set<string>,
+  enabledNames: string[],
+) {
+  localStorage.setItem(
+    GIFT_TYPE_FILTER_KEY(streamId),
+    JSON.stringify({
+      on: [...types],
+      known: enabledNames.map((n) => n.toLowerCase()),
+    }),
+  );
+}
+
+function giftMatchesFeedFilter(
+  item: GiftLogItem,
+  minDiamonds: number,
+  activeTypes: Set<string>,
+): boolean {
+  if (giftDiamondSpend(item.diamondValue, item.giftCount) < minDiamonds) {
+    return false;
+  }
+  if (activeTypes.size === 0) return true;
+  const name = item.giftName?.toLowerCase();
+  return Boolean(name && activeTypes.has(name));
+}
+
+type ChatFilterKind =
+  | 'flagged'
+  | 'watch'
+  | 'gifter'
+  | 'mod'
+  | 'sub'
+  | 'follow';
+
+const CHAT_FILTER_TYPES: { type: ChatFilterKind; label: string }[] = [
+  { type: 'flagged', label: 'Flagged' },
+  { type: 'watch', label: 'Watch' },
+  { type: 'gifter', label: 'Gifted' },
+  { type: 'mod', label: 'Mods' },
+  { type: 'sub', label: 'Subs' },
+  { type: 'follow', label: 'Followers' },
+];
+
+const CHAT_FILTER_KEY = (streamId: string) =>
+  `live-mod:chat-filters:${streamId}`;
+
+function loadChatFilters(streamId: string): Set<ChatFilterKind> {
+  const allowed = new Set(CHAT_FILTER_TYPES.map((t) => t.type));
+  try {
+    const raw = localStorage.getItem(CHAT_FILTER_KEY(streamId));
+    if (!raw) return new Set();
+    return new Set(
+      (JSON.parse(raw) as ChatFilterKind[]).filter((t) => allowed.has(t)),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function saveChatFilters(streamId: string, types: Set<ChatFilterKind>) {
+  localStorage.setItem(CHAT_FILTER_KEY(streamId), JSON.stringify([...types]));
+}
+
+function chatMatchesFeedFilter(
+  item: ChatLogItem,
+  filters: Set<ChatFilterKind>,
+  watchlist: Set<string>,
+  gifts: GiftLogItem[],
+  highlights: ChatHighlightConfig,
+): boolean {
+  if (filters.size === 0) return true;
+  const uname = item.username?.toLowerCase() ?? '';
+  if (filters.has('flagged') && item.flaggedKeyword) return true;
+  if (filters.has('watch') && uname && watchlist.has(uname)) return true;
+  if (filters.has('gifter') && uname) {
+    const gifters = recentGifterUsernames(
+      gifts,
+      highlights,
+      item.createdAt,
+      true,
+    );
+    if (gifters.has(uname)) return true;
+  }
+  const s = item.userSignals;
+  if (filters.has('mod') && s?.isModerator) return true;
+  if (filters.has('sub') && s?.isSubscriber) return true;
+  if (filters.has('follow') && s?.isFollower) return true;
+  return false;
+}
+
 const EMPTY_FEED: LiveFeed = {
   streamId: '',
   status: 'idle',
   statusDetail: null,
   isCheckedIn: false,
   chatHighlights: DEFAULT_CHAT_HIGHLIGHTS,
+  enabledGiftNames: [],
   chat: [],
   events: [],
   gifts: [],
@@ -434,6 +576,20 @@ function ModApp(
                 await refreshLive();
               })
             }
+            onGiftDoneAll={(giftIds) =>
+              void withBusy(async () => {
+                if (!selected || giftIds.length === 0) return;
+                await markGiftsDone(selected, giftIds);
+                await refreshLive();
+              })
+            }
+            onGiftUndoAll={(giftIds) =>
+              void withBusy(async () => {
+                if (!selected || giftIds.length === 0) return;
+                await markGiftsPending(selected, giftIds);
+                await refreshLive();
+              })
+            }
           />
         ) : null}
 
@@ -550,15 +706,36 @@ function LivePanel(
     onDone: (queueItemId: string) => void;
     onGiftDone: (giftId: string) => void;
     onGiftUndo: (giftId: string) => void;
+    onGiftDoneAll: (giftIds: string[]) => void;
+    onGiftUndoAll: (giftIds: string[]) => void;
   }>,
 ) {
   const [eventFilters, setEventFilters] = useState<Set<RoomEventType>>(() =>
     defaultEventFilters(),
   );
+  const [chatFilters, setChatFilters] = useState<Set<ChatFilterKind>>(
+    () => new Set(),
+  );
+  const [giftMinDiamondsText, setGiftMinDiamondsText] = useState('0');
+  const [giftTypeFilters, setGiftTypeFilters] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [bulkUndoIds, setBulkUndoIds] = useState<string[]>([]);
+
+  const enabledGiftNames = props.feed.enabledGiftNames ?? [];
+  const enabledGiftKey = enabledGiftNames.map((n) => n.toLowerCase()).join('\0');
 
   useEffect(() => {
     if (!props.selected) return;
     setEventFilters(loadEventFilters(props.selected));
+    setChatFilters(loadChatFilters(props.selected));
+    setGiftMinDiamondsText(String(loadGiftMinDiamonds(props.selected)));
+    const names = enabledGiftKey ? enabledGiftKey.split('\0') : [];
+    setGiftTypeFilters(loadGiftTypeFilters(props.selected, names));
+  }, [props.selected, enabledGiftKey]);
+
+  useEffect(() => {
+    setBulkUndoIds([]);
   }, [props.selected]);
 
   function toggleEventType(type: RoomEventType) {
@@ -568,6 +745,36 @@ function LivePanel(
       if (next.has(type)) next.delete(type);
       else next.add(type);
       saveEventFilters(props.selected!, next);
+      return next;
+    });
+  }
+
+  function toggleChatFilter(type: ChatFilterKind) {
+    if (!props.selected) return;
+    setChatFilters((prev) => {
+      const next = new Set(prev);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      saveChatFilters(props.selected!, next);
+      return next;
+    });
+  }
+
+  function updateGiftMinDiamonds(raw: string) {
+    if (!/^\d*$/.test(raw)) return;
+    setGiftMinDiamondsText(raw);
+    if (!props.selected) return;
+    saveGiftMinDiamonds(props.selected, raw === '' ? 0 : Number(raw));
+  }
+
+  function toggleGiftType(name: string) {
+    if (!props.selected) return;
+    const key = name.toLowerCase();
+    setGiftTypeFilters((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      saveGiftTypeFilters(props.selected!, next, enabledGiftNames);
       return next;
     });
   }
@@ -582,8 +789,28 @@ function LivePanel(
   }
 
   const highlights = props.feed.chatHighlights ?? DEFAULT_CHAT_HIGHLIGHTS;
+  const watchlist = new Set(
+    highlights.highlightUsernames.map((u) => u.toLowerCase()),
+  );
+  const filteredChat = props.feed.chat.filter((item) =>
+    chatMatchesFeedFilter(
+      item,
+      chatFilters,
+      watchlist,
+      props.feed.gifts,
+      highlights,
+    ),
+  );
   const filteredEvents = props.feed.events.filter(
     (e) => e.type === 'stream_end' || eventFilters.has(e.type),
+  );
+  const giftMinDiamonds =
+    giftMinDiamondsText === '' ? 0 : Number(giftMinDiamondsText);
+  const filteredGifts = props.feed.gifts.filter((g) =>
+    giftMatchesFeedFilter(g, giftMinDiamonds, giftTypeFilters),
+  );
+  const importantTypes = new Set(
+    enabledGiftNames.map((n) => n.toLowerCase()),
   );
 
   return (
@@ -592,22 +819,99 @@ function LivePanel(
         <FeedColumn
           title="Gifts"
           className="feed-primary"
-          empty="No gifts yet.">
+          empty="No gifts yet."
+          headerExtra={
+            <div className="gift-filters">
+              <label className="gift-min-diamonds">
+                <span>Min ◆</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={giftMinDiamondsText}
+                  onChange={(e) => updateGiftMinDiamonds(e.target.value)}
+                />
+              </label>
+              {enabledGiftNames.length > 0 ? (
+                <div className="pill-row">
+                  {enabledGiftNames.map((name) => (
+                    <button
+                      key={name.toLowerCase()}
+                      type="button"
+                      className={
+                        giftTypeFilters.has(name.toLowerCase())
+                          ? 'pill active'
+                          : 'pill'
+                      }
+                      onClick={() => toggleGiftType(name)}>
+                      {name}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          }>
           <GiftList
-            items={props.feed.gifts}
+            items={filteredGifts}
+            empty={
+              props.feed.gifts.length === 0
+                ? 'No gifts yet.'
+                : 'No matching gifts.'
+            }
+            importantTypes={importantTypes}
             hostUsername={props.selected}
             busy={props.busy}
-            onDone={props.onGiftDone}
-            onUndo={props.onGiftUndo}
+            bulkUndoIds={bulkUndoIds}
+            onDone={(giftId) => {
+              setBulkUndoIds([]);
+              props.onGiftDone(giftId);
+            }}
+            onUndo={(giftId) => {
+              setBulkUndoIds([]);
+              props.onGiftUndo(giftId);
+            }}
+            onDoneAll={(giftIds) => {
+              setBulkUndoIds(giftIds);
+              props.onGiftDoneAll(giftIds);
+            }}
+            onUndoAll={() => {
+              if (bulkUndoIds.length === 0) return;
+              const ids = bulkUndoIds;
+              setBulkUndoIds([]);
+              props.onGiftUndoAll(ids);
+            }}
           />
         </FeedColumn>
 
         <div className="live-secondary">
-          <FeedColumn title="Chat" className="feed-chat" empty="No chat yet.">
+          <FeedColumn
+            title="Chat"
+            className="feed-chat"
+            empty="No chat yet."
+            headerExtra={
+              <div className="pill-row">
+                {CHAT_FILTER_TYPES.map((f) => (
+                  <button
+                    key={f.type}
+                    type="button"
+                    className={
+                      chatFilters.has(f.type) ? 'pill active' : 'pill'
+                    }
+                    onClick={() => toggleChatFilter(f.type)}>
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            }>
             <ChatList
-              items={props.feed.chat}
+              items={filteredChat}
               gifts={props.feed.gifts}
               highlights={highlights}
+              empty={
+                props.feed.chat.length === 0
+                  ? 'No chat yet.'
+                  : 'No matching chat.'
+              }
               busy={props.busy}
               onDone={props.onDone}
             />
@@ -664,13 +968,15 @@ function recentGifterUsernames(
   gifts: GiftLogItem[],
   highlights: ChatHighlightConfig,
   atTime: number,
+  enabled = highlights.highlightRecentGifters,
 ): Set<string> {
   const names = new Set<string>();
-  if (!highlights.highlightRecentGifters) return names;
+  if (!enabled) return names;
   const windowMs = highlights.recentGifterWindowSeconds * 1000;
   for (const g of gifts) {
     if (!g.senderUsername) continue;
-    if ((g.diamondValue ?? 0) < highlights.recentGifterMinDiamonds) continue;
+    if (giftDiamondSpend(g.diamondValue, g.giftCount) < highlights.recentGifterMinDiamonds)
+      continue;
     if (atTime - g.createdAt > windowMs || atTime < g.createdAt) continue;
     names.add(g.senderUsername.toLowerCase());
   }
@@ -682,6 +988,7 @@ function ChatList(
     items: ChatLogItem[];
     gifts: GiftLogItem[];
     highlights: ChatHighlightConfig;
+    empty?: string;
     busy: boolean;
     onDone: (queueItemId: string) => void;
   }>,
@@ -693,7 +1000,9 @@ function ChatList(
   );
 
   if (props.items.length === 0) {
-    return <p className="muted feed-empty">No chat yet.</p>;
+    return (
+      <p className="muted feed-empty">{props.empty ?? 'No chat yet.'}</p>
+    );
   }
   return (
     <div className="feed-inner">
@@ -819,84 +1128,182 @@ function EventList(props: Readonly<{ items: RoomLogItem[] }>) {
   );
 }
 
-function GiftList(
+function giftIsToGuest(
+  targetUsername: string | null,
+  hostUsername: string | null,
+): boolean {
+  if (targetUsername == null || hostUsername == null) return false;
+  return targetUsername.toLowerCase() !== hostUsername.toLowerCase();
+}
+
+function GiftBulkBar(
   props: Readonly<{
-    items: GiftLogItem[];
+    pendingIds: string[];
+    showUndoAll: boolean;
+    busy: boolean;
+    onDoneAll: (giftIds: string[]) => void;
+    onUndoAll: () => void;
+  }>,
+) {
+  const showDoneAll = props.pendingIds.length > 0;
+  if (!props.showUndoAll && !showDoneAll) return null;
+  return (
+    <div className="gift-done-all">
+      {props.showUndoAll ? (
+        <button
+          type="button"
+          className="tiny"
+          disabled={props.busy}
+          onClick={props.onUndoAll}>
+          Undo all
+        </button>
+      ) : null}
+      {showDoneAll ? (
+        <button
+          type="button"
+          className="primary tiny"
+          disabled={props.busy}
+          onClick={() => props.onDoneAll(props.pendingIds)}>
+          Mark all done
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function GiftLine(
+  props: Readonly<{
+    item: GiftLogItem;
+    important: boolean;
     hostUsername: string | null;
     busy: boolean;
     onDone: (giftId: string) => void;
     onUndo: (giftId: string) => void;
   }>,
 ) {
-  if (props.items.length === 0) {
-    return <p className="muted feed-empty">No gifts yet.</p>;
+  const { item } = props;
+  const pending = item.alertStatus !== 'done';
+  const done = item.alertStatus === 'done';
+  const toGuest = giftIsToGuest(item.targetUsername, props.hostUsername);
+  const targetLabel = formatGiftTarget(
+    item.targetUsername,
+    item.targetNickname,
+  );
+  const spend =
+    item.diamondValue == null
+      ? null
+      : giftDiamondSpend(item.diamondValue, item.giftCount);
+  const className = [
+    'feed-line gift-line',
+    item.matchedRule && pending ? 'alert' : '',
+    props.important ? 'hl-enabled' : '',
+    done ? 'faded' : '',
+    toGuest ? 'gift-to-guest' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  return (
+    <div className={className}>
+      <FeedTime at={item.createdAt} />
+      <div className="feed-line-main">
+        <span className="chat-user">@{item.senderUsername ?? 'someone'}</span>
+        <span className="chat-body">
+          sent{' '}
+          <span className={props.important ? 'gift-name important' : 'gift-name'}>
+            {item.giftName ?? 'gift'}
+          </span>
+          {spend == null ? (
+            <> ×{item.giftCount}</>
+          ) : (
+            <span className="gift-spend"> {spend}◆</span>
+          )}
+          {targetLabel ? (
+            <>
+              {' '}
+              to{' '}
+              <span className={toGuest ? 'gift-target guest' : 'gift-target'}>
+                {targetLabel}
+              </span>
+            </>
+          ) : null}
+          {toGuest ? <span className="tag tag-guest"> guest</span> : null}
+          {item.matchedRule ? (
+            <span className="tag"> {item.matchedRule}</span>
+          ) : null}
+        </span>
+      </div>
+      {pending ? (
+        <button
+          type="button"
+          className="primary tiny"
+          disabled={props.busy}
+          onClick={() => props.onDone(item.id)}>
+          Done
+        </button>
+      ) : (
+        <button
+          type="button"
+          className="tiny"
+          disabled={props.busy}
+          onClick={() => props.onUndo(item.id)}>
+          Undo
+        </button>
+      )}
+    </div>
+  );
+}
+
+function GiftList(
+  props: Readonly<{
+    items: GiftLogItem[];
+    empty?: string;
+    importantTypes: Set<string>;
+    hostUsername: string | null;
+    busy: boolean;
+    bulkUndoIds: string[];
+    onDone: (giftId: string) => void;
+    onUndo: (giftId: string) => void;
+    onDoneAll: (giftIds: string[]) => void;
+    onUndoAll: () => void;
+  }>,
+) {
+  const pendingIds = props.items
+    .filter((item) => item.alertStatus !== 'done')
+    .map((item) => item.id);
+  const showUndoAll = props.bulkUndoIds.length > 0;
+  const empty = props.empty ?? 'No gifts yet.';
+
+  if (props.items.length === 0 && !showUndoAll) {
+    return <p className="muted feed-empty">{empty}</p>;
   }
   return (
     <div className="feed-inner gifts">
-      {props.items.map((item) => {
-        const pending = item.alertStatus !== 'done';
-        const done = item.alertStatus === 'done';
-        const isAlert = Boolean(item.matchedRule) && pending;
-        const target = item.targetUsername;
-        const host = props.hostUsername;
-        const toGuest =
-          target != null &&
-          host != null &&
-          target.toLowerCase() !== host.toLowerCase();
-        const targetLabel = formatGiftTarget(
-          item.targetUsername,
-          item.targetNickname,
-        );
-        return (
-          <div
+      <GiftBulkBar
+        pendingIds={pendingIds}
+        showUndoAll={showUndoAll}
+        busy={props.busy}
+        onDoneAll={props.onDoneAll}
+        onUndoAll={props.onUndoAll}
+      />
+      {props.items.length === 0 ? (
+        <p className="muted feed-empty">{empty}</p>
+      ) : (
+        props.items.map((item) => (
+          <GiftLine
             key={item.id}
-            className={`feed-line gift-line ${isAlert ? 'alert' : ''} ${done ? 'faded' : ''} ${toGuest ? 'gift-to-guest' : ''}`}>
-            <FeedTime at={item.createdAt} />
-            <div className="feed-line-main">
-              <span className="chat-user">
-                @{item.senderUsername ?? 'someone'}
-              </span>
-              <span className="chat-body">
-                sent {item.giftName ?? 'gift'} ×{item.giftCount}
-                {targetLabel ? (
-                  <>
-                    {' '}
-                    to{' '}
-                    <span
-                      className={toGuest ? 'gift-target guest' : 'gift-target'}>
-                      {targetLabel}
-                    </span>
-                  </>
-                ) : null}
-                {toGuest ? <span className="tag tag-guest"> guest</span> : null}
-                {item.diamondValue != null ? (
-                  <span className="muted"> · {item.diamondValue}◆</span>
-                ) : null}
-                {item.matchedRule ? (
-                  <span className="tag"> {item.matchedRule}</span>
-                ) : null}
-              </span>
-            </div>
-            {pending ? (
-              <button
-                type="button"
-                className="primary tiny"
-                disabled={props.busy}
-                onClick={() => props.onDone(item.id)}>
-                Done
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="tiny"
-                disabled={props.busy}
-                onClick={() => props.onUndo(item.id)}>
-                Undo
-              </button>
+            item={item}
+            important={Boolean(
+              item.giftName &&
+                props.importantTypes.has(item.giftName.toLowerCase()),
             )}
-          </div>
-        );
-      })}
+            hostUsername={props.hostUsername}
+            busy={props.busy}
+            onDone={props.onDone}
+            onUndo={props.onUndo}
+          />
+        ))
+      )}
     </div>
   );
 }
@@ -1014,6 +1421,384 @@ function StreamsPanel(
   );
 }
 
+function SwitchField(
+  props: Readonly<{
+    label: string;
+    checked: boolean;
+    onChange: (checked: boolean) => void;
+  }>,
+) {
+  return (
+    <label className="switch-field">
+      <span>{props.label}</span>
+      <span className="switch">
+        <input
+          type="checkbox"
+          role="switch"
+          checked={props.checked}
+          onChange={(e) => props.onChange(e.target.checked)}
+        />
+        <span className="switch-ui" aria-hidden />
+      </span>
+    </label>
+  );
+}
+
+type StreamSettingsValues = {
+  keywordsText: string;
+  minDiamonds: string;
+  notifyDiamonds: boolean;
+  catalogGifts: GiftCatalogItem[];
+  enabledGiftKeys: string[];
+  notifyGifts: boolean;
+  highlightUsersText: string;
+  highlightRecentGifters: boolean;
+  recentGifterMinDiamonds: string;
+  recentGifterWindowSeconds: string;
+};
+
+async function fetchStreamSettingsValues(
+  streamId: string,
+): Promise<StreamSettingsValues> {
+  const cfg = await getConfig(streamId);
+  const diamondRule = cfg.giftAlertRules.find(
+    (r) => typeof r.minDiamondValue === 'number' && !r.giftName,
+  );
+  const namedRules = cfg.giftAlertRules.filter((r) =>
+    Boolean(r.giftName?.trim()),
+  );
+  const enabledGiftKeys = namedRules
+    .map((r) => r.giftName?.trim().toLowerCase())
+    .filter((n): n is string => Boolean(n));
+  let fromCatalog: GiftCatalogItem[] = [];
+  try {
+    fromCatalog = (await getGiftCatalog()).gifts ?? [];
+  } catch {
+    fromCatalog = [];
+  }
+  const catalogKeys = new Set(fromCatalog.map((g) => g.name.toLowerCase()));
+  const extras: GiftCatalogItem[] = namedRules
+    .map((r) => r.giftName?.trim())
+    .filter((n): n is string => Boolean(n))
+    .filter((n) => !catalogKeys.has(n.toLowerCase()))
+    .map((name) => ({ id: null, name, diamondValue: null }));
+  const h = cfg.chatHighlights ?? DEFAULT_CHAT_HIGHLIGHTS;
+  return {
+    keywordsText: cfg.chatKeywordFlags.join('\n'),
+    minDiamonds: String(diamondRule?.minDiamondValue ?? 100),
+    notifyDiamonds: diamondRule?.notify !== false,
+    catalogGifts: dedupeGiftCatalogByName([...extras, ...fromCatalog]),
+    enabledGiftKeys,
+    notifyGifts:
+      namedRules.length === 0 || namedRules.some((r) => r.notify !== false),
+    highlightUsersText: h.highlightUsernames.join('\n'),
+    highlightRecentGifters: h.highlightRecentGifters,
+    recentGifterMinDiamonds: String(h.recentGifterMinDiamonds),
+    recentGifterWindowSeconds: String(h.recentGifterWindowSeconds),
+  };
+}
+
+function splitSettingLines(text: string): string[] {
+  return text
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function buildStreamConfigUpdate(input: {
+  catalogGifts: GiftCatalogItem[];
+  enabledGiftKeys: Set<string>;
+  minDiamonds: string;
+  notifyDiamonds: boolean;
+  notifyGifts: boolean;
+  keywordsText: string;
+  highlightUsersText: string;
+  highlightRecentGifters: boolean;
+  recentGifterMinDiamonds: string;
+  recentGifterWindowSeconds: string;
+}): {
+  giftAlertRules: GiftAlertRule[];
+  chatKeywordFlags: string[];
+  chatHighlights: ChatHighlightConfig;
+} {
+  const names = input.catalogGifts
+    .filter((g) => input.enabledGiftKeys.has(g.name.toLowerCase()))
+    .map((g) => g.name);
+  const diamondValue = Number(input.minDiamonds) || 100;
+  return {
+    giftAlertRules: [
+      {
+        minDiamondValue: diamondValue,
+        label: `Gift ≥ ${diamondValue} diamonds`,
+        notify: input.notifyDiamonds,
+      },
+      ...names.map((giftName) => ({
+        giftName,
+        label: giftName,
+        notify: input.notifyGifts,
+      })),
+    ],
+    chatKeywordFlags: splitSettingLines(input.keywordsText),
+    chatHighlights: {
+      highlightUsernames: splitSettingLines(input.highlightUsersText).map(
+        (s) => s.replace(/^@/, ''),
+      ),
+      highlightRecentGifters: input.highlightRecentGifters,
+      recentGifterMinDiamonds: Number(input.recentGifterMinDiamonds) || 1,
+      recentGifterWindowSeconds: Number(input.recentGifterWindowSeconds) || 120,
+    },
+  };
+}
+
+function GiftPickerItem(
+  props: Readonly<{
+    gift: GiftCatalogItem;
+    checked: boolean;
+    onToggle: (key: string) => void;
+  }>,
+) {
+  const key = props.gift.name.toLowerCase();
+  return (
+    <label className="check-field gift-picker-item">
+      <input
+        type="checkbox"
+        checked={props.checked}
+        onChange={() => props.onToggle(key)}
+      />
+      <span>{props.gift.name}</span>
+      {props.gift.diamondValue != null ? (
+        <span className="muted">{props.gift.diamondValue}◆</span>
+      ) : null}
+    </label>
+  );
+}
+
+function GiftPicker(
+  props: Readonly<{
+    catalogGifts: GiftCatalogItem[];
+    catalogQuery: string;
+    enabledGiftKeys: Set<string>;
+    onQueryChange: (value: string) => void;
+    onToggleKey: (key: string) => void;
+  }>,
+) {
+  const query = props.catalogQuery.trim().toLowerCase();
+  const selectedGifts = props.catalogGifts.filter((g) =>
+    props.enabledGiftKeys.has(g.name.toLowerCase()),
+  );
+  const searchHits =
+    query.length === 0
+      ? []
+      : props.catalogGifts
+          .filter((g) => g.name.toLowerCase().includes(query))
+          .filter((g) => !props.enabledGiftKeys.has(g.name.toLowerCase()))
+          .slice(0, 40);
+
+  if (props.catalogGifts.length === 0) {
+    return <p className="muted">Gift catalog unavailable.</p>;
+  }
+
+  return (
+    <>
+      <input
+        type="search"
+        value={props.catalogQuery}
+        onChange={(e) => props.onQueryChange(e.target.value)}
+        placeholder="Search live gifts to add"
+      />
+      {selectedGifts.length > 0 ? (
+        <div className="gift-picker">
+          {selectedGifts.map((gift) => (
+            <GiftPickerItem
+              key={gift.name.toLowerCase()}
+              gift={gift}
+              checked
+              onToggle={props.onToggleKey}
+            />
+          ))}
+        </div>
+      ) : (
+        <p className="muted">No important gifts selected yet.</p>
+      )}
+      {query.length > 0 ? (
+        <div className="gift-picker gift-picker-search">
+          {searchHits.length === 0 ? (
+            <p className="muted">No matching gifts.</p>
+          ) : (
+            searchHits.map((gift) => (
+              <GiftPickerItem
+                key={gift.name.toLowerCase()}
+                gift={gift}
+                checked={false}
+                onToggle={props.onToggleKey}
+              />
+            ))
+          )}
+        </div>
+      ) : (
+        <p className="muted">
+          Search to add from {props.catalogGifts.length} live gifts.
+        </p>
+      )}
+    </>
+  );
+}
+
+function StreamSettingsForm(
+  props: Readonly<{
+    busy: boolean;
+    streamId: string;
+    withBusy: (fn: () => Promise<void>) => Promise<void>;
+    onSaved: () => void;
+    keywordsText: string;
+    minDiamonds: string;
+    notifyDiamonds: boolean;
+    catalogGifts: GiftCatalogItem[];
+    catalogQuery: string;
+    enabledGiftKeys: Set<string>;
+    notifyGifts: boolean;
+    highlightUsersText: string;
+    highlightRecentGifters: boolean;
+    recentGifterMinDiamonds: string;
+    recentGifterWindowSeconds: string;
+    setKeywordsText: (v: string) => void;
+    setMinDiamonds: (v: string) => void;
+    setNotifyDiamonds: (v: boolean) => void;
+    setCatalogQuery: (v: string) => void;
+    setEnabledGiftKeys: (updater: (prev: Set<string>) => Set<string>) => void;
+    setNotifyGifts: (v: boolean) => void;
+    setHighlightUsersText: (v: string) => void;
+    setHighlightRecentGifters: (v: boolean) => void;
+    setRecentGifterMinDiamonds: (v: string) => void;
+    setRecentGifterWindowSeconds: (v: string) => void;
+  }>,
+) {
+  function toggleGiftKey(key: string) {
+    props.setEnabledGiftKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  return (
+    <>
+      <div className="settings-block">
+        <SwitchField
+          label="Diamond threshold alerts"
+          checked={props.notifyDiamonds}
+          onChange={props.setNotifyDiamonds}
+        />
+        {props.notifyDiamonds ? (
+          <label className="field nested">
+            <span>Min diamonds spent</span>
+            <input
+              type="number"
+              min={1}
+              value={props.minDiamonds}
+              onChange={(e) => props.setMinDiamonds(e.target.value)}
+            />
+          </label>
+        ) : null}
+      </div>
+      <div className="settings-block">
+        <SwitchField
+          label="Gift type alerts"
+          checked={props.notifyGifts}
+          onChange={props.setNotifyGifts}
+        />
+        {props.notifyGifts ? (
+          <div className="field nested">
+            <span>Important gifts</span>
+            <GiftPicker
+              catalogGifts={props.catalogGifts}
+              catalogQuery={props.catalogQuery}
+              enabledGiftKeys={props.enabledGiftKeys}
+              onQueryChange={props.setCatalogQuery}
+              onToggleKey={toggleGiftKey}
+            />
+          </div>
+        ) : null}
+      </div>
+      <label className="field">
+        <span>Flagged chat keywords (one per line)</span>
+        <textarea
+          rows={3}
+          value={props.keywordsText}
+          onChange={(e) => props.setKeywordsText(e.target.value)}
+          placeholder={'spam\nscam'}
+        />
+      </label>
+      <label className="field">
+        <span>Always highlight usernames (one per line)</span>
+        <textarea
+          rows={3}
+          value={props.highlightUsersText}
+          onChange={(e) => props.setHighlightUsersText(e.target.value)}
+          placeholder={'vip_user\ncohost'}
+        />
+      </label>
+      <label className="check-field">
+        <input
+          type="checkbox"
+          checked={props.highlightRecentGifters}
+          onChange={(e) => props.setHighlightRecentGifters(e.target.checked)}
+        />
+        <span>Highlight chat from recent gifters</span>
+      </label>
+      <div className="row">
+        <label className="field grow">
+          <span>Gifter min diamonds spent</span>
+          <input
+            type="number"
+            min={1}
+            value={props.recentGifterMinDiamonds}
+            onChange={(e) => props.setRecentGifterMinDiamonds(e.target.value)}
+          />
+        </label>
+        <label className="field grow">
+          <span>Window (seconds)</span>
+          <input
+            type="number"
+            min={10}
+            value={props.recentGifterWindowSeconds}
+            onChange={(e) =>
+              props.setRecentGifterWindowSeconds(e.target.value)
+            }
+          />
+        </label>
+      </div>
+      <button
+        type="button"
+        className="primary"
+        disabled={props.busy}
+        onClick={() =>
+          void props.withBusy(async () => {
+            await putConfig(
+              props.streamId,
+              buildStreamConfigUpdate({
+                catalogGifts: props.catalogGifts,
+                enabledGiftKeys: props.enabledGiftKeys,
+                minDiamonds: props.minDiamonds,
+                notifyDiamonds: props.notifyDiamonds,
+                notifyGifts: props.notifyGifts,
+                keywordsText: props.keywordsText,
+                highlightUsersText: props.highlightUsersText,
+                highlightRecentGifters: props.highlightRecentGifters,
+                recentGifterMinDiamonds: props.recentGifterMinDiamonds,
+                recentGifterWindowSeconds: props.recentGifterWindowSeconds,
+              }),
+            );
+            props.onSaved();
+          })
+        }>
+        Save stream settings
+      </button>
+    </>
+  );
+}
+
 function StreamSettingsEditor(
   props: Readonly<{
     streamId: string;
@@ -1028,6 +1813,13 @@ function StreamSettingsEditor(
   const [loadError, setLoadError] = useState<string | null>(null);
   const [keywordsText, setKeywordsText] = useState('');
   const [minDiamonds, setMinDiamonds] = useState('100');
+  const [notifyDiamonds, setNotifyDiamonds] = useState(true);
+  const [catalogGifts, setCatalogGifts] = useState<GiftCatalogItem[]>([]);
+  const [catalogQuery, setCatalogQuery] = useState('');
+  const [enabledGiftKeys, setEnabledGiftKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [notifyGifts, setNotifyGifts] = useState(true);
   const [highlightUsersText, setHighlightUsersText] = useState('');
   const [highlightRecentGifters, setHighlightRecentGifters] = useState(true);
   const [recentGifterMinDiamonds, setRecentGifterMinDiamonds] = useState('1');
@@ -1038,135 +1830,71 @@ function StreamSettingsEditor(
     let cancelled = false;
     setLoading(true);
     setLoadError(null);
-    void (async () => {
-      try {
-        const cfg = await getConfig(streamId);
+    void fetchStreamSettingsValues(streamId).then(
+      (values) => {
         if (cancelled) return;
-        setKeywordsText(cfg.chatKeywordFlags.join('\n'));
-        const diamondRule = cfg.giftAlertRules.find(
-          (r) => typeof r.minDiamondValue === 'number',
-        );
-        setMinDiamonds(String(diamondRule?.minDiamondValue ?? 100));
-        const h = cfg.chatHighlights ?? DEFAULT_CHAT_HIGHLIGHTS;
-        setHighlightUsersText(h.highlightUsernames.join('\n'));
-        setHighlightRecentGifters(h.highlightRecentGifters);
-        setRecentGifterMinDiamonds(String(h.recentGifterMinDiamonds));
-        setRecentGifterWindowSeconds(String(h.recentGifterWindowSeconds));
-      } catch (err) {
+        setKeywordsText(values.keywordsText);
+        setMinDiamonds(values.minDiamonds);
+        setNotifyDiamonds(values.notifyDiamonds);
+        setCatalogGifts(values.catalogGifts);
+        setEnabledGiftKeys(new Set(values.enabledGiftKeys));
+        setNotifyGifts(values.notifyGifts);
+        setHighlightUsersText(values.highlightUsersText);
+        setHighlightRecentGifters(values.highlightRecentGifters);
+        setRecentGifterMinDiamonds(values.recentGifterMinDiamonds);
+        setRecentGifterWindowSeconds(values.recentGifterWindowSeconds);
+      },
+      (err: unknown) => {
         if (cancelled) return;
         if (isUnauthorized(err)) {
           onUnauthorized();
           return;
         }
         setLoadError(err instanceof Error ? err.message : String(err));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
+      },
+    ).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
     return () => {
       cancelled = true;
     };
   }, [streamId, onUnauthorized]);
+
+  const ready = !loading && !loadError;
 
   return (
     <div className="stream-settings">
       <h3 className="settings-section">Alerts &amp; highlights</h3>
       {loading ? <p className="muted">Loading settings…</p> : null}
       {loadError ? <p className="banner error">{loadError}</p> : null}
-      {!loading && !loadError ? (
-        <>
-          <label className="field">
-            <span>Gift alert: min diamonds</span>
-            <input
-              type="number"
-              min={1}
-              value={minDiamonds}
-              onChange={(e) => setMinDiamonds(e.target.value)}
-            />
-          </label>
-          <label className="field">
-            <span>Flagged chat keywords (one per line)</span>
-            <textarea
-              rows={3}
-              value={keywordsText}
-              onChange={(e) => setKeywordsText(e.target.value)}
-              placeholder={'spam\nscam'}
-            />
-          </label>
-          <label className="field">
-            <span>Always highlight usernames (one per line)</span>
-            <textarea
-              rows={3}
-              value={highlightUsersText}
-              onChange={(e) => setHighlightUsersText(e.target.value)}
-              placeholder={'vip_user\ncohost'}
-            />
-          </label>
-          <label className="check-field">
-            <input
-              type="checkbox"
-              checked={highlightRecentGifters}
-              onChange={(e) => setHighlightRecentGifters(e.target.checked)}
-            />
-            <span>Highlight chat from recent gifters</span>
-          </label>
-          <div className="row">
-            <label className="field grow">
-              <span>Gifter min diamonds</span>
-              <input
-                type="number"
-                min={1}
-                value={recentGifterMinDiamonds}
-                onChange={(e) => setRecentGifterMinDiamonds(e.target.value)}
-              />
-            </label>
-            <label className="field grow">
-              <span>Window (seconds)</span>
-              <input
-                type="number"
-                min={10}
-                value={recentGifterWindowSeconds}
-                onChange={(e) => setRecentGifterWindowSeconds(e.target.value)}
-              />
-            </label>
-          </div>
-          <button
-            type="button"
-            className="primary"
-            disabled={props.busy}
-            onClick={() =>
-              void props.withBusy(async () => {
-                const rules: GiftAlertRule[] = [
-                  {
-                    minDiamondValue: Number(minDiamonds) || 100,
-                    label: `Gift ≥ ${Number(minDiamonds) || 100} diamonds`,
-                  },
-                ];
-                const chatKeywordFlags = keywordsText
-                  .split('\n')
-                  .map((s) => s.trim())
-                  .filter(Boolean);
-                const chatHighlights: ChatHighlightConfig = {
-                  highlightUsernames: highlightUsersText
-                    .split('\n')
-                    .map((s) => s.trim().replace(/^@/, ''))
-                    .filter(Boolean),
-                  highlightRecentGifters,
-                  recentGifterMinDiamonds: Number(recentGifterMinDiamonds) || 1,
-                  recentGifterWindowSeconds:
-                    Number(recentGifterWindowSeconds) || 120,
-                };
-                await putConfig(props.streamId, {
-                  giftAlertRules: rules,
-                  chatKeywordFlags,
-                  chatHighlights,
-                });
-                props.onSaved();
-              })
-            }>
-            Save stream settings
-          </button>
-        </>
+      {ready ? (
+        <StreamSettingsForm
+          busy={props.busy}
+          streamId={props.streamId}
+          withBusy={props.withBusy}
+          onSaved={props.onSaved}
+          keywordsText={keywordsText}
+          minDiamonds={minDiamonds}
+          notifyDiamonds={notifyDiamonds}
+          catalogGifts={catalogGifts}
+          catalogQuery={catalogQuery}
+          enabledGiftKeys={enabledGiftKeys}
+          notifyGifts={notifyGifts}
+          highlightUsersText={highlightUsersText}
+          highlightRecentGifters={highlightRecentGifters}
+          recentGifterMinDiamonds={recentGifterMinDiamonds}
+          recentGifterWindowSeconds={recentGifterWindowSeconds}
+          setKeywordsText={setKeywordsText}
+          setMinDiamonds={setMinDiamonds}
+          setNotifyDiamonds={setNotifyDiamonds}
+          setCatalogQuery={setCatalogQuery}
+          setEnabledGiftKeys={setEnabledGiftKeys}
+          setNotifyGifts={setNotifyGifts}
+          setHighlightUsersText={setHighlightUsersText}
+          setHighlightRecentGifters={setHighlightRecentGifters}
+          setRecentGifterMinDiamonds={setRecentGifterMinDiamonds}
+          setRecentGifterWindowSeconds={setRecentGifterWindowSeconds}
+        />
       ) : null}
     </div>
   );

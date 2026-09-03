@@ -63,6 +63,18 @@ async function handleRelayRoutes(
     return forwardToStream(env, eventStream, "/events", request);
   }
 
+  if (pathname === "/api/gift-catalog" && request.method === "PUT") {
+    const denied = requireRelayAuth(request, env);
+    if (denied) return denied;
+    return registryStub(env).fetch(
+      new Request("https://registry/gift-catalog", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: await request.text(),
+      }),
+    );
+  }
+
   return null;
 }
 
@@ -110,6 +122,11 @@ async function handleQueueAndConfig(
     return (
       denied ?? forwardToStream(env, queue, "/queue", request, extra)
     );
+  }
+
+  const giftsBulk = matchStreamPath(pathname, "/gifts");
+  if (giftsBulk && request.method === "PATCH") {
+    return denied ?? forwardToStream(env, giftsBulk, "/gifts", request);
   }
 
   const patchTarget = matchStreamPatch(pathname);
@@ -206,6 +223,14 @@ async function handlePushRoutes(
     if (denied) return denied;
     return registryStub(env).fetch(
       new Request("https://registry/test-push", { method: "POST" }),
+    );
+  }
+
+  if (pathname === "/api/gift-catalog" && request.method === "GET") {
+    const denied = requireModAuth(request, env);
+    if (denied) return denied;
+    return registryStub(env).fetch(
+      new Request("https://registry/gift-catalog"),
     );
   }
 

@@ -1,6 +1,7 @@
 import type {
   ChatHighlightConfig,
   ConnectionStatus,
+  GiftCatalogItem,
   LiveFeed,
   StreamConfig,
 } from '@tiktok-mod/shared';
@@ -124,6 +125,31 @@ export function markGiftPending(
   return setGiftStatus(streamId, giftId, 'pending');
 }
 
+export function markGiftsDone(
+  streamId: string,
+  giftIds: string[],
+): Promise<unknown> {
+  return setGiftsStatus(streamId, giftIds, 'done');
+}
+
+export function markGiftsPending(
+  streamId: string,
+  giftIds: string[],
+): Promise<unknown> {
+  return setGiftsStatus(streamId, giftIds, 'pending');
+}
+
+function setGiftsStatus(
+  streamId: string,
+  giftIds: string[],
+  status: 'done' | 'pending',
+): Promise<unknown> {
+  return api(`/api/streams/${encodeURIComponent(streamId)}/gifts`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status, ids: giftIds }),
+  });
+}
+
 function setGiftStatus(
   streamId: string,
   giftId: string,
@@ -151,6 +177,13 @@ export function putConfig(
     method: 'PUT',
     body: JSON.stringify(body),
   });
+}
+
+export function getGiftCatalog(): Promise<{
+  gifts: GiftCatalogItem[];
+  updatedAt: number | null;
+}> {
+  return api('/api/gift-catalog');
 }
 
 export function subscribePush(
