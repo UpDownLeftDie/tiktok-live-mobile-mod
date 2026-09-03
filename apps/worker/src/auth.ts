@@ -22,6 +22,15 @@ export function requireModAuth(request: Request, env: Env): Response | null {
   return null;
 }
 
+/** Stable PWA device id (uuid). Used so check-out is per-device, not global. */
+export function parseClientId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const id = value.trim();
+  if (id.length < 8 || id.length > 80) return null;
+  if (!/^[\w-]+$/.test(id)) return null;
+  return id;
+}
+
 export function streamStub(env: Env, streamId: string): DurableObjectStub {
   const id = env.STREAM_SESSION.idFromName(streamId);
   return env.STREAM_SESSION.get(id);

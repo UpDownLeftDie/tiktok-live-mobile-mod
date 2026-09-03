@@ -1,15 +1,19 @@
 import {
   DEFAULT_CHAT_HIGHLIGHTS,
-  DEFAULT_CHAT_KEYWORDS,
-  DEFAULT_GIFT_ALERT_RULES,
+  DEFAULT_GLOBAL_SETTINGS,
   formatGiftAlertBody,
+  formatPersonLabel,
   giftDiamondSpend,
+  isDefaultAlertSettings,
+  resolveAlertSettings,
+  type AlertSettingsOverrides,
   type ChatHighlightConfig,
   type ChatLogItem,
   type ChatUserSignals,
   type ConnectionStatus,
   type GiftAlertRule,
   type GiftLogItem,
+  type GlobalSettings,
   type LiveFeed,
   type PushNotificationPayload,
   type QueueItem,
@@ -24,19 +28,40 @@ import {
   type RoomLogItem,
   type StreamConfig,
 } from '@tiktok-mod/shared';
+import { parseClientId } from './auth';
 import type { Env } from './env';
 
 const CHAT_LIMIT = 200;
 const EVENT_LIMIT = 200;
 const GIFT_LIMIT = 200;
+const GLOBAL_SETTINGS_TTL_MS = 10_000;
 
 function uuid(): string {
   return crypto.randomUUID();
 }
 
+async function readWatcherBody(
+  request: Request,
+): Promise<{ clientId: string | null; force: boolean }> {
+  try {
+    const body = (await request.json()) as {
+      clientId?: unknown;
+      force?: unknown;
+    };
+    return {
+      clientId: parseClientId(body.clientId),
+      force: body.force === true,
+    };
+  } catch {
+    return { clientId: null, force: false };
+  }
+}
+
 export class StreamSession implements DurableObject {
   private readonly env: Env;
   private migrated = false;
+  private globalSettingsCache: { value: GlobalSettings; fetchedAt: number } | null =
+    null;
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -68,6 +93,7 @@ export class StreamSession implements DurableObject {
         id TEXT PRIMARY KEY,
         stream_id TEXT NOT NULL,
         sender_username TEXT,
+        sender_nickname TEXT,
         gift_name TEXT,
         gift_count INTEGER,
         diamond_value INTEGER,
@@ -94,12 +120,13 @@ export class StreamSession implements DurableObject {
         stream_id TEXT NOT NULL,
         type TEXT NOT NULL,
         username TEXT,
+        nickname TEXT,
         summary TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS stream_config (
         stream_id TEXT PRIMARY KEY,
-        gift_alert_rules TEXT NOT NULL,
+        gift_alert_rules TEXT,
         chat_keyword_flags TEXT,
         chat_highlights TEXT,
         is_checked_in INTEGER NOT NULL DEFAULT 0,
@@ -117,6 +144,7 @@ export class StreamSession implements DurableObject {
     this.ensureColumn('gift_log', 'queue_item_id', 'TEXT');
     this.ensureColumn('gift_log', 'matched_rule', 'TEXT');
     this.ensureColumn('gift_log', 'target_nickname', 'TEXT');
+    this.ensureColumn('gift_log', 'sender_nickname', 'TEXT');
     this.ensureColumn(
       'chat_log',
       'is_new_chatter',
@@ -131,6 +159,42 @@ export class StreamSession implements DurableObject {
     this.ensureColumn('stream_config', 'connection_detail', 'TEXT');
     this.ensureColumn('stream_config', 'status_updated_at', 'INTEGER');
     this.ensureColumn('stream_config', 'chat_highlights', 'TEXT');
+    this.ensureColumn('room_events', 'nickname', 'TEXT');
+    this.relaxStreamConfigNullability();
+    this.migrateDefaultConfigsToInherit();
+  }
+
+  /** Recreate stream_config so alert columns can be NULL (inherit global). */
+  private relaxStreamConfigNullability(): void {
+    const cols = this.ctx.storage.sql
+      .exec<{ name: string; notnull: number }>(
+        'PRAGMA table_info(stream_config)',
+      )
+      .toArray();
+    const giftCol = cols.find((c) => c.name === 'gift_alert_rules');
+    if (!giftCol || giftCol.notnull === 0) return;
+
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE stream_config_nullable (
+        stream_id TEXT PRIMARY KEY,
+        gift_alert_rules TEXT,
+        chat_keyword_flags TEXT,
+        chat_highlights TEXT,
+        is_checked_in INTEGER NOT NULL DEFAULT 0,
+        connection_status TEXT NOT NULL DEFAULT 'idle',
+        connection_detail TEXT,
+        status_updated_at INTEGER
+      );
+      INSERT INTO stream_config_nullable (
+        stream_id, gift_alert_rules, chat_keyword_flags, chat_highlights,
+        is_checked_in, connection_status, connection_detail, status_updated_at
+      )
+      SELECT stream_id, gift_alert_rules, chat_keyword_flags, chat_highlights,
+             is_checked_in, connection_status, connection_detail, status_updated_at
+      FROM stream_config;
+      DROP TABLE stream_config;
+      ALTER TABLE stream_config_nullable RENAME TO stream_config;
+    `);
   }
 
   private ensureColumn(table: string, column: string, typeSql: string): void {
@@ -154,45 +218,133 @@ export class StreamSession implements DurableObject {
       `INSERT INTO stream_config (
          stream_id, gift_alert_rules, chat_keyword_flags, chat_highlights,
          is_checked_in, connection_status, connection_detail, status_updated_at
-       ) VALUES (?, ?, ?, ?, 0, 'idle', NULL, ?)`,
+       ) VALUES (?, NULL, NULL, NULL, 0, 'idle', NULL, ?)`,
       streamId,
-      JSON.stringify(DEFAULT_GIFT_ALERT_RULES),
-      JSON.stringify(DEFAULT_CHAT_KEYWORDS),
-      JSON.stringify(DEFAULT_CHAT_HIGHLIGHTS),
       Date.now(),
     );
   }
 
-  private parseHighlights(raw: string | null | undefined): ChatHighlightConfig {
-    if (!raw) return { ...DEFAULT_CHAT_HIGHLIGHTS };
-    try {
-      return {
-        ...DEFAULT_CHAT_HIGHLIGHTS,
-        ...(JSON.parse(raw) as ChatHighlightConfig),
-      };
-    } catch {
-      return { ...DEFAULT_CHAT_HIGHLIGHTS };
+  /** Clear stored defaults so streams inherit global settings. */
+  private migrateDefaultConfigsToInherit(): void {
+    const rows = this.ctx.storage.sql
+      .exec<{
+        stream_id: string;
+        gift_alert_rules: string | null;
+        chat_keyword_flags: string | null;
+        chat_highlights: string | null;
+      }>('SELECT stream_id, gift_alert_rules, chat_keyword_flags, chat_highlights FROM stream_config')
+      .toArray();
+    for (const row of rows) {
+      if (
+        row.gift_alert_rules == null &&
+        row.chat_keyword_flags == null &&
+        row.chat_highlights == null
+      ) {
+        continue;
+      }
+      const parsed = parseStoredAlertSettings(row);
+      if (!parsed) continue;
+      if (!isDefaultAlertSettings(parsed)) continue;
+      this.ctx.storage.sql.exec(
+        `UPDATE stream_config
+         SET gift_alert_rules = NULL, chat_keyword_flags = NULL, chat_highlights = NULL
+         WHERE stream_id = ?`,
+        row.stream_id,
+      );
     }
   }
 
-  private getConfig(streamId: string): StreamConfig {
+  private async fetchGlobalSettings(): Promise<GlobalSettings> {
+    const now = Date.now();
+    if (
+      this.globalSettingsCache &&
+      now - this.globalSettingsCache.fetchedAt < GLOBAL_SETTINGS_TTL_MS
+    ) {
+      return this.globalSettingsCache.value;
+    }
+    try {
+      const res = await this.env.REGISTRY.get(
+        this.env.REGISTRY.idFromName('global'),
+      ).fetch(new Request('https://registry/global-settings'));
+      if (res.ok) {
+        const value = (await res.json()) as GlobalSettings;
+        this.globalSettingsCache = { value, fetchedAt: now };
+        return value;
+      }
+    } catch (err) {
+      console.error('Failed to fetch global settings', err);
+    }
+    return this.globalSettingsCache?.value ?? { ...DEFAULT_GLOBAL_SETTINGS };
+  }
+
+  private readOverrides(streamId: string): AlertSettingsOverrides {
+    this.ensureConfig(streamId);
+    const row = this.ctx.storage.sql
+      .exec<{
+        gift_alert_rules: string | null;
+        chat_keyword_flags: string | null;
+        chat_highlights: string | null;
+      }>(
+        `SELECT gift_alert_rules, chat_keyword_flags, chat_highlights
+         FROM stream_config WHERE stream_id = ?`,
+        streamId,
+      )
+      .one();
+
+    const overrides: AlertSettingsOverrides = {};
+    if (row.gift_alert_rules != null) {
+      try {
+        overrides.giftAlertRules = JSON.parse(
+          row.gift_alert_rules,
+        ) as GiftAlertRule[];
+      } catch {
+        overrides.giftAlertRules = null;
+      }
+    } else {
+      overrides.giftAlertRules = null;
+    }
+    if (row.chat_keyword_flags != null) {
+      try {
+        overrides.chatKeywordFlags = JSON.parse(
+          row.chat_keyword_flags,
+        ) as string[];
+      } catch {
+        overrides.chatKeywordFlags = null;
+      }
+    } else {
+      overrides.chatKeywordFlags = null;
+    }
+    if (row.chat_highlights != null) {
+      try {
+        overrides.chatHighlights = JSON.parse(
+          row.chat_highlights,
+        ) as ChatHighlightConfig;
+      } catch {
+        overrides.chatHighlights = null;
+      }
+    } else {
+      overrides.chatHighlights = null;
+    }
+    return overrides;
+  }
+
+  private async getResolvedConfig(streamId: string): Promise<StreamConfig> {
     this.ensureConfig(streamId);
     const row = this.ctx.storage.sql
       .exec<{
         stream_id: string;
-        gift_alert_rules: string;
-        chat_keyword_flags: string | null;
-        chat_highlights: string | null;
         is_checked_in: number;
-      }>('SELECT * FROM stream_config WHERE stream_id = ?', streamId)
+      }>('SELECT stream_id, is_checked_in FROM stream_config WHERE stream_id = ?', streamId)
       .one();
-
+    const global = await this.fetchGlobalSettings();
+    const overrides = this.readOverrides(streamId);
+    const resolved = resolveAlertSettings(global, overrides);
     return {
       streamId: row.stream_id,
-      giftAlertRules: JSON.parse(row.gift_alert_rules) as GiftAlertRule[],
-      chatKeywordFlags: JSON.parse(row.chat_keyword_flags ?? '[]') as string[],
-      chatHighlights: this.parseHighlights(row.chat_highlights),
+      ...resolved,
       isCheckedIn: row.is_checked_in === 1,
+      overrides,
+      global,
     };
   }
 
@@ -235,9 +387,11 @@ export class StreamSession implements DurableObject {
 
     switch (routeKey) {
       case 'POST /check-in':
-        return this.handleCheckIn(streamId);
+        return this.handleCheckIn(streamId, request);
       case 'POST /check-out':
-        return this.handleCheckOut(streamId);
+        return this.handleCheckOut(streamId, request);
+      case 'POST /sync-check':
+        return this.handleSyncCheck(streamId, request);
       case 'POST /events':
         return this.handleEvent(streamId, (await request.json()) as RelayEvent);
       case 'GET /live':
@@ -248,7 +402,7 @@ export class StreamSession implements DurableObject {
           url.searchParams.get('status') ?? undefined,
         );
       case 'GET /config':
-        return Response.json(this.getConfig(streamId));
+        return Response.json(await this.getResolvedConfig(streamId));
       case 'PUT /config':
         return this.handlePutConfig(streamId, await request.json());
       case 'PATCH /gifts':
@@ -274,55 +428,130 @@ export class StreamSession implements DurableObject {
     return null;
   }
 
-  private async handleCheckIn(streamId: string): Promise<Response> {
+  private async handleCheckIn(
+    streamId: string,
+    request: Request,
+  ): Promise<Response> {
     if (!streamId) {
       return Response.json({ error: 'streamId required' }, { status: 400 });
     }
+    const body = await readWatcherBody(request);
+    if (!body.clientId) {
+      return Response.json({ error: 'clientId required' }, { status: 400 });
+    }
     this.ensureConfig(streamId);
-    this.ctx.storage.sql.exec(
-      'UPDATE stream_config SET is_checked_in = 1 WHERE stream_id = ?',
-      streamId,
-    );
-    this.setStatus(streamId, 'waiting', 'checked_in');
 
-    await this.env.REGISTRY.get(this.env.REGISTRY.idFromName('global')).fetch(
+    const result = await this.env.REGISTRY.get(
+      this.env.REGISTRY.idFromName('global'),
+    ).fetch(
       new Request('https://registry/check-in', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ streamId }),
+        body: JSON.stringify({ streamId, clientId: body.clientId }),
       }),
     );
-
-    return Response.json({ ok: true, streamId, isCheckedIn: true });
+    const payload = (await result.json()) as {
+      isCheckedIn?: boolean;
+      watcherCount?: number;
+      youAreWatching?: boolean;
+      error?: string;
+    };
+    if (!result.ok) {
+      return Response.json(payload, { status: result.status });
+    }
+    this.applyCheckedIn(streamId, payload.isCheckedIn !== false);
+    return Response.json({
+      ok: true,
+      streamId,
+      isCheckedIn: payload.isCheckedIn !== false,
+      watcherCount: payload.watcherCount ?? 1,
+      youAreWatching: payload.youAreWatching !== false,
+    });
   }
 
-  private async handleCheckOut(streamId: string): Promise<Response> {
+  private async handleCheckOut(
+    streamId: string,
+    request: Request,
+  ): Promise<Response> {
     if (!streamId) {
       return Response.json({ error: 'streamId required' }, { status: 400 });
     }
+    const body = await readWatcherBody(request);
+    if (!body.clientId) {
+      return Response.json({ error: 'clientId required' }, { status: 400 });
+    }
     this.ensureConfig(streamId);
-    this.ctx.storage.sql.exec(
-      'UPDATE stream_config SET is_checked_in = 0 WHERE stream_id = ?',
-      streamId,
-    );
-    this.setStatus(streamId, 'idle', 'checked_out');
 
-    await this.env.REGISTRY.get(this.env.REGISTRY.idFromName('global')).fetch(
+    const result = await this.env.REGISTRY.get(
+      this.env.REGISTRY.idFromName('global'),
+    ).fetch(
       new Request('https://registry/check-out', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ streamId }),
+        body: JSON.stringify({
+          streamId,
+          clientId: body.clientId,
+          force: body.force,
+        }),
       }),
     );
+    const payload = (await result.json()) as {
+      isCheckedIn?: boolean;
+      watcherCount?: number;
+      youAreWatching?: boolean;
+      error?: string;
+    };
+    if (!result.ok) {
+      return Response.json(payload, { status: result.status });
+    }
+    this.applyCheckedIn(streamId, Boolean(payload.isCheckedIn));
+    return Response.json({
+      ok: true,
+      streamId,
+      isCheckedIn: Boolean(payload.isCheckedIn),
+      watcherCount: payload.watcherCount ?? 0,
+      youAreWatching: Boolean(payload.youAreWatching),
+    });
+  }
 
-    return Response.json({ ok: true, streamId, isCheckedIn: false });
+  private async handleSyncCheck(
+    streamId: string,
+    request: Request,
+  ): Promise<Response> {
+    if (!streamId) {
+      return Response.json({ error: 'streamId required' }, { status: 400 });
+    }
+    const body = (await request.json()) as { isCheckedIn?: boolean };
+    this.applyCheckedIn(streamId, Boolean(body.isCheckedIn));
+    return Response.json({ ok: true, streamId, isCheckedIn: Boolean(body.isCheckedIn) });
+  }
+
+  private applyCheckedIn(streamId: string, isCheckedIn: boolean): void {
+    this.ensureConfig(streamId);
+    const row = this.ctx.storage.sql
+      .exec<{ is_checked_in: number }>(
+        'SELECT is_checked_in FROM stream_config WHERE stream_id = ?',
+        streamId,
+      )
+      .one();
+    const was = row.is_checked_in === 1;
+    this.ctx.storage.sql.exec(
+      'UPDATE stream_config SET is_checked_in = ? WHERE stream_id = ?',
+      isCheckedIn ? 1 : 0,
+      streamId,
+    );
+    if (was && !isCheckedIn) {
+      this.setStatus(streamId, 'idle', 'checked_out');
+    } else if (!was && isCheckedIn) {
+      this.setStatus(streamId, 'waiting', 'checked_in');
+    }
   }
 
   private async handleEvent(
     streamId: string,
     event: RelayEvent,
   ): Promise<Response> {
-    const config = this.getConfig(streamId);
+    const config = await this.getResolvedConfig(streamId);
     if (
       !config.isCheckedIn &&
       event.kind !== 'disconnected' &&
@@ -354,12 +583,13 @@ export class StreamSession implements DurableObject {
 
   private handleRoom(streamId: string, event: RelayRoomEvent): Response {
     this.ctx.storage.sql.exec(
-      `INSERT INTO room_events (id, stream_id, type, username, summary, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO room_events (id, stream_id, type, username, nickname, summary, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       event.eventId,
       streamId,
       event.type,
       event.username,
+      event.nickname ?? null,
       event.summary,
       event.createdAt,
     );
@@ -376,10 +606,12 @@ export class StreamSession implements DurableObject {
     let queueItemId: string | null = null;
     const alertStatus: 'none' | 'pending' = 'pending';
     let matchedRule: string | null = null;
+    const senderNickname = event.senderNickname ?? null;
 
     if (matched) {
       const payload: QueueItemPayload = {
         senderUsername: event.senderUsername,
+        senderNickname,
         giftName: event.giftName,
         giftCount: event.giftCount,
         diamondValue: event.diamondValue,
@@ -398,12 +630,13 @@ export class StreamSession implements DurableObject {
 
     this.ctx.storage.sql.exec(
       `INSERT INTO gift_log (
-         id, stream_id, sender_username, gift_name, gift_count, diamond_value,
+         id, stream_id, sender_username, sender_nickname, gift_name, gift_count, diamond_value,
          target_username, target_nickname, alert_status, queue_item_id, matched_rule, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       event.eventId,
       streamId,
       event.senderUsername,
+      senderNickname,
       event.giftName,
       event.giftCount,
       event.diamondValue,
@@ -417,9 +650,18 @@ export class StreamSession implements DurableObject {
     this.trimTable('gift_log', streamId, GIFT_LIMIT);
 
     if (matched && queueItemId) {
+      const mode =
+        config.global?.nameDisplayMode ??
+        DEFAULT_GLOBAL_SETTINGS.nameDisplayMode;
       await this.pushAlert({
         title: matched.label,
-        body: formatGiftAlertBody(event),
+        body: formatGiftAlertBody(
+          {
+            ...event,
+            senderNickname,
+          },
+          mode,
+        ),
         tag: queueItemId,
         streamId,
         queueItemId,
@@ -441,10 +683,12 @@ export class StreamSession implements DurableObject {
   ): Promise<Response> {
     const keyword = matchChatKeyword(config.chatKeywordFlags, event.comment);
     let queueItemId: string | null = null;
+    const nickname = event.userSignals?.nickname ?? null;
 
     if (keyword) {
       const payload: QueueItemPayload = {
         username: event.username,
+        nickname,
         comment: event.comment,
         matchedKeyword: keyword,
       };
@@ -474,9 +718,18 @@ export class StreamSession implements DurableObject {
     this.trimTable('chat_log', streamId, CHAT_LIMIT);
 
     if (keyword && queueItemId) {
+      const mode =
+        config.global?.nameDisplayMode ??
+        DEFAULT_GLOBAL_SETTINGS.nameDisplayMode;
+      const who = formatPersonLabel(
+        event.username,
+        nickname,
+        mode,
+        'anon',
+      );
       await this.pushAlert({
         title: `Flagged chat: ${keyword}`,
-        body: `${event.username ?? 'anon'}: ${event.comment}`,
+        body: `${who}: ${event.comment}`,
         tag: queueItemId,
         streamId,
         queueItemId,
@@ -545,18 +798,14 @@ export class StreamSession implements DurableObject {
     return id;
   }
 
-  private handleGetLive(streamId: string): Response {
-    this.ensureConfig(streamId);
+  private async handleGetLive(streamId: string): Promise<Response> {
+    const config = await this.getResolvedConfig(streamId);
     const cfg = this.ctx.storage.sql
       .exec<{
-        is_checked_in: number;
         connection_status: string;
         connection_detail: string | null;
-        chat_highlights: string | null;
-        gift_alert_rules: string;
       }>(
-        `SELECT is_checked_in, connection_status, connection_detail,
-                chat_highlights, gift_alert_rules
+        `SELECT connection_status, connection_detail
          FROM stream_config WHERE stream_id = ?`,
         streamId,
       )
@@ -604,6 +853,7 @@ export class StreamSession implements DurableObject {
         stream_id: string;
         type: string;
         username: string | null;
+        nickname: string | null;
         summary: string;
         created_at: number;
       }>(
@@ -618,6 +868,7 @@ export class StreamSession implements DurableObject {
         streamId: r.stream_id,
         type: r.type as RoomLogItem['type'],
         username: r.username,
+        nickname: r.nickname ?? null,
         summary: r.summary,
         createdAt: r.created_at,
       }));
@@ -627,6 +878,7 @@ export class StreamSession implements DurableObject {
         id: string;
         stream_id: string;
         sender_username: string | null;
+        sender_nickname: string | null;
         gift_name: string | null;
         gift_count: number;
         diamond_value: number | null;
@@ -647,6 +899,7 @@ export class StreamSession implements DurableObject {
         id: r.id,
         streamId: r.stream_id,
         senderUsername: r.sender_username,
+        senderNickname: r.sender_nickname ?? null,
         giftName: r.gift_name,
         giftCount: r.gift_count,
         diamondValue: r.diamond_value,
@@ -662,9 +915,12 @@ export class StreamSession implements DurableObject {
       streamId,
       status: (cfg.connection_status || 'idle') as ConnectionStatus,
       statusDetail: cfg.connection_detail,
-      isCheckedIn: cfg.is_checked_in === 1,
-      chatHighlights: this.parseHighlights(cfg.chat_highlights),
-      enabledGiftNames: enabledGiftNamesFromRules(cfg.gift_alert_rules),
+      isCheckedIn: config.isCheckedIn,
+      chatHighlights: config.chatHighlights,
+      nameDisplayMode:
+        config.global?.nameDisplayMode ??
+        DEFAULT_GLOBAL_SETTINGS.nameDisplayMode,
+      enabledGiftNames: enabledGiftNamesFromRules(config.giftAlertRules),
       chat,
       events,
       gifts,
@@ -816,42 +1072,82 @@ export class StreamSession implements DurableObject {
     });
   }
 
-  private handlePutConfig(streamId: string, body: unknown): Response {
+  private async handlePutConfig(
+    streamId: string,
+    body: unknown,
+  ): Promise<Response> {
     this.ensureConfig(streamId);
     const input = body as {
-      giftAlertRules?: GiftAlertRule[];
-      chatKeywordFlags?: string[];
-      chatHighlights?: ChatHighlightConfig;
+      giftAlertRules?: GiftAlertRule[] | null;
+      chatKeywordFlags?: string[] | null;
+      chatHighlights?: ChatHighlightConfig | Partial<ChatHighlightConfig> | null;
+      clearOverrides?: boolean;
     };
-    if (input.giftAlertRules) {
-      this.ctx.storage.sql.exec(
-        'UPDATE stream_config SET gift_alert_rules = ? WHERE stream_id = ?',
-        JSON.stringify(input.giftAlertRules),
+
+    if (input.clearOverrides) {
+      this.clearAllOverrides(streamId);
+      return Response.json(await this.getResolvedConfig(streamId));
+    }
+
+    if ('giftAlertRules' in input) {
+      this.writeNullableJsonColumn(
+        'gift_alert_rules',
         streamId,
+        emptyArrayToNull(input.giftAlertRules),
       );
     }
-    if (input.chatKeywordFlags) {
-      this.ctx.storage.sql.exec(
-        'UPDATE stream_config SET chat_keyword_flags = ? WHERE stream_id = ?',
-        JSON.stringify(input.chatKeywordFlags),
+    if ('chatKeywordFlags' in input) {
+      this.writeNullableJsonColumn(
+        'chat_keyword_flags',
         streamId,
+        emptyArrayToNull(input.chatKeywordFlags),
       );
     }
-    if (input.chatHighlights) {
-      const merged = {
-        ...DEFAULT_CHAT_HIGHLIGHTS,
-        ...input.chatHighlights,
-        highlightUsernames: (input.chatHighlights.highlightUsernames ?? [])
-          .map((u) => u.trim().replace(/^@/, ''))
-          .filter(Boolean),
-      };
-      this.ctx.storage.sql.exec(
-        'UPDATE stream_config SET chat_highlights = ? WHERE stream_id = ?',
-        JSON.stringify(merged),
-        streamId,
-      );
+    if ('chatHighlights' in input) {
+      this.writeChatHighlightsOverride(streamId, input.chatHighlights);
     }
-    return Response.json(this.getConfig(streamId));
+    return Response.json(await this.getResolvedConfig(streamId));
+  }
+
+  private clearAllOverrides(streamId: string): void {
+    this.ctx.storage.sql.exec(
+      `UPDATE stream_config
+       SET gift_alert_rules = NULL, chat_keyword_flags = NULL, chat_highlights = NULL
+       WHERE stream_id = ?`,
+      streamId,
+    );
+  }
+
+  private writeNullableJsonColumn(
+    column: 'gift_alert_rules' | 'chat_keyword_flags' | 'chat_highlights',
+    streamId: string,
+    value: unknown,
+  ): void {
+    this.ctx.storage.sql.exec(
+      `UPDATE stream_config SET ${column} = ? WHERE stream_id = ?`,
+      value == null ? null : JSON.stringify(value),
+      streamId,
+    );
+  }
+
+  private writeChatHighlightsOverride(
+    streamId: string,
+    highlights:
+      | ChatHighlightConfig
+      | Partial<ChatHighlightConfig>
+      | null
+      | undefined,
+  ): void {
+    if (highlights == null) {
+      this.writeNullableJsonColumn('chat_highlights', streamId, null);
+      return;
+    }
+    const stored = partialHighlightsForStorage(highlights);
+    this.writeNullableJsonColumn(
+      'chat_highlights',
+      streamId,
+      Object.keys(stored).length === 0 ? null : stored,
+    );
   }
 
   private async pushAlert(payload: PushNotificationPayload): Promise<void> {
@@ -862,6 +1158,61 @@ export class StreamSession implements DurableObject {
         body: JSON.stringify(payload),
       }),
     );
+  }
+}
+
+function emptyArrayToNull<T>(value: T[] | null | undefined): T[] | null {
+  if (value == null || value.length === 0) return null;
+  return value;
+}
+
+function partialHighlightsForStorage(
+  h: ChatHighlightConfig | Partial<ChatHighlightConfig>,
+): Partial<ChatHighlightConfig> {
+  const stored: Partial<ChatHighlightConfig> = {};
+  if (Array.isArray(h.highlightUsernames)) {
+    const usernames = h.highlightUsernames
+      .map((u) => u.trim().replace(/^@/, ''))
+      .filter(Boolean);
+    if (usernames.length > 0) stored.highlightUsernames = usernames;
+  }
+  if (typeof h.highlightRecentGifters === 'boolean') {
+    stored.highlightRecentGifters = h.highlightRecentGifters;
+  }
+  if (typeof h.recentGifterMinDiamonds === 'number') {
+    stored.recentGifterMinDiamonds = h.recentGifterMinDiamonds;
+  }
+  if (typeof h.recentGifterWindowSeconds === 'number') {
+    stored.recentGifterWindowSeconds = h.recentGifterWindowSeconds;
+  }
+  return stored;
+}
+
+function parseStoredAlertSettings(row: {
+  gift_alert_rules: string | null;
+  chat_keyword_flags: string | null;
+  chat_highlights: string | null;
+}): {
+  giftAlertRules: GiftAlertRule[];
+  chatKeywordFlags: string[];
+  chatHighlights: ChatHighlightConfig;
+} | null {
+  try {
+    const giftAlertRules = row.gift_alert_rules
+      ? (JSON.parse(row.gift_alert_rules) as GiftAlertRule[])
+      : [];
+    const chatKeywordFlags = row.chat_keyword_flags
+      ? (JSON.parse(row.chat_keyword_flags) as string[])
+      : [];
+    const chatHighlights = row.chat_highlights
+      ? {
+          ...DEFAULT_CHAT_HIGHLIGHTS,
+          ...(JSON.parse(row.chat_highlights) as ChatHighlightConfig),
+        }
+      : { ...DEFAULT_CHAT_HIGHLIGHTS };
+    return { giftAlertRules, chatKeywordFlags, chatHighlights };
+  } catch {
+    return null;
   }
 }
 

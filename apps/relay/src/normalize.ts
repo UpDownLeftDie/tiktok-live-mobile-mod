@@ -254,6 +254,7 @@ export function normalizeGift(
     streamId,
     eventId: randomUUID(),
     senderUsername: usernameOf(data.user),
+    senderNickname: emptyToNull(data.user?.nickname),
     giftName,
     giftId: parseGiftId(data.giftId),
     giftCount: Number(data.repeatCount) || 1,
@@ -276,6 +277,7 @@ export function normalizeRoomEvent(
     eventId: randomUUID(),
     type,
     username: usernameOf(data.user),
+    nickname: emptyToNull(data.user?.nickname),
     summary,
     createdAt: Date.now(),
   };

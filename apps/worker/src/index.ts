@@ -89,7 +89,11 @@ async function handleStreamCollection(
   if (denied) return denied;
 
   if (request.method === "GET") {
-    return registryStub(env).fetch(new Request("https://registry/streams"));
+    const clientId = request.headers.get("X-Mod-Client-Id") ?? "";
+    const qs = clientId
+      ? `?clientId=${encodeURIComponent(clientId)}`
+      : "";
+    return registryStub(env).fetch(new Request(`https://registry/streams${qs}`));
   }
   if (request.method === "POST") {
     return registryStub(env).fetch(
@@ -201,6 +205,23 @@ async function handleStreamItem(
   return handleQueueAndConfig(request, env, pathname, url, denied);
 }
 
+async function handlePresenceRoute(
+  request: Request,
+  env: Env,
+  pathname: string,
+): Promise<Response | null> {
+  if (pathname !== "/api/presence" || request.method !== "POST") return null;
+  const denied = requireModAuth(request, env);
+  if (denied) return denied;
+  return registryStub(env).fetch(
+    new Request("https://registry/presence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: await request.text(),
+    }),
+  );
+}
+
 async function handlePushRoutes(
   request: Request,
   env: Env,
@@ -234,6 +255,25 @@ async function handlePushRoutes(
     );
   }
 
+  if (pathname === "/api/global-settings") {
+    const denied = requireModAuth(request, env);
+    if (denied) return denied;
+    if (request.method === "GET") {
+      return registryStub(env).fetch(
+        new Request("https://registry/global-settings"),
+      );
+    }
+    if (request.method === "PUT") {
+      return registryStub(env).fetch(
+        new Request("https://registry/global-settings", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: await request.text(),
+        }),
+      );
+    }
+  }
+
   return null;
 }
 
@@ -259,6 +299,9 @@ async function handleApi(
 
   const item = await handleStreamItem(request, env, pathname, url);
   if (item) return item;
+
+  const presence = await handlePresenceRoute(request, env, pathname);
+  if (presence) return presence;
 
   const push = await handlePushRoutes(request, env, pathname);
   if (push) return push;

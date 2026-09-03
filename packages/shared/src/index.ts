@@ -1,24 +1,24 @@
 /** Shared types for relay ↔ worker ↔ PWA. */
 
-export type QueueItemType = "gift_threshold" | "flagged_chat";
+export type QueueItemType = 'gift_threshold' | 'flagged_chat';
 
-export type QueueItemStatus = "pending" | "done";
+export type QueueItemStatus = 'pending' | 'done';
 
 export type ConnectionStatus =
-  | "idle"
-  | "waiting"
-  | "live"
-  | "offline"
-  | "disconnected";
+  | 'idle'
+  | 'waiting'
+  | 'live'
+  | 'offline'
+  | 'disconnected';
 
 export type RoomEventType =
-  | "follow"
-  | "share"
-  | "like"
-  | "member"
-  | "subscribe"
-  | "stream_end"
-  | "other";
+  | 'follow'
+  | 'share'
+  | 'like'
+  | 'member'
+  | 'subscribe'
+  | 'stream_end'
+  | 'other';
 
 export interface GiftAlertRule {
   /** Match a specific gift name (case-insensitive). */
@@ -34,11 +34,8 @@ export interface GiftAlertRule {
   notify?: boolean;
 }
 
-export type { GiftCatalogItem } from "./gift-catalog.js";
-export {
-  GIFT_CATALOG,
-  dedupeGiftCatalogByName,
-} from "./gift-catalog.js";
+export { dedupeGiftCatalogByName, GIFT_CATALOG } from './gift-catalog.js';
+export type { GiftCatalogItem } from './gift-catalog.js';
 
 export interface ChatHighlightConfig {
   /** Usernames (uniqueId) always highlighted in chat. */
@@ -58,25 +55,186 @@ export const DEFAULT_CHAT_HIGHLIGHTS: ChatHighlightConfig = {
   recentGifterWindowSeconds: 120,
 };
 
-export interface StreamConfig {
-  streamId: string;
+export interface AlertSettings {
   giftAlertRules: GiftAlertRule[];
   chatKeywordFlags: string[];
   chatHighlights: ChatHighlightConfig;
+}
+
+export interface AlertSettingsOverrides {
+  giftAlertRules?: GiftAlertRule[] | null;
+  chatKeywordFlags?: string[] | null;
+  chatHighlights?: Partial<ChatHighlightConfig> | null;
+}
+
+export type NameDisplayMode = 'username' | 'nickname' | 'both';
+
+export const DEFAULT_NAME_DISPLAY_MODE: NameDisplayMode = 'username';
+
+export interface GlobalSettings extends AlertSettings {
+  nameDisplayMode: NameDisplayMode;
+}
+
+export interface StreamConfig extends AlertSettings {
+  streamId: string;
   isCheckedIn: boolean;
+  /** Stored per-stream overrides (null/empty fields inherit global). */
+  overrides?: AlertSettingsOverrides;
+  /** App-wide defaults used when resolving effective settings. */
+  global?: GlobalSettings;
 }
 
 export const DEFAULT_GIFT_ALERT_RULES: GiftAlertRule[] = [
-  { minDiamondValue: 100, label: "Gift ≥ 100 diamonds" },
+  { minDiamondValue: 100, label: 'Gift ≥ 100 diamonds' },
 ];
 
 export const DEFAULT_CHAT_KEYWORDS: string[] = [];
 
+export const DEFAULT_ALERT_SETTINGS: AlertSettings = {
+  giftAlertRules: DEFAULT_GIFT_ALERT_RULES,
+  chatKeywordFlags: DEFAULT_CHAT_KEYWORDS,
+  chatHighlights: DEFAULT_CHAT_HIGHLIGHTS,
+};
+
+export const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
+  ...DEFAULT_ALERT_SETTINGS,
+  nameDisplayMode: DEFAULT_NAME_DISPLAY_MODE,
+};
+
+function isDiamondRule(rule: GiftAlertRule): boolean {
+  return typeof rule.minDiamondValue === 'number' && !rule.giftName;
+}
+
+function isNamedGiftRule(rule: GiftAlertRule): boolean {
+  return Boolean(rule.giftName?.trim());
+}
+
+function splitGiftRules(rules: GiftAlertRule[]): {
+  diamond: GiftAlertRule | undefined;
+  named: GiftAlertRule[];
+} {
+  return {
+    diamond: rules.find(isDiamondRule),
+    named: rules.filter(isNamedGiftRule),
+  };
+}
+
+function mergeGiftAlertRules(
+  globalRules: GiftAlertRule[],
+  overrideRules: GiftAlertRule[] | null | undefined,
+): GiftAlertRule[] {
+  if (overrideRules == null || overrideRules.length === 0) {
+    return globalRules;
+  }
+  const global = splitGiftRules(globalRules);
+  const over = splitGiftRules(overrideRules);
+  const hasDiamondOverride = over.diamond != null;
+  const hasNamedOverride = over.named.length > 0;
+  if (!hasDiamondOverride && !hasNamedOverride) {
+    return globalRules;
+  }
+  const diamond = hasDiamondOverride ? over.diamond : global.diamond;
+  const named = hasNamedOverride ? over.named : global.named;
+  return [...(diamond ? [diamond] : []), ...named];
+}
+
+function mergeChatHighlights(
+  global: ChatHighlightConfig,
+  override: Partial<ChatHighlightConfig> | null | undefined,
+): ChatHighlightConfig {
+  if (!override) return { ...global };
+  const usernames = override.highlightUsernames;
+  return {
+    highlightUsernames:
+      usernames != null && usernames.length > 0
+        ? usernames
+        : global.highlightUsernames,
+    highlightRecentGifters:
+      typeof override.highlightRecentGifters === 'boolean'
+        ? override.highlightRecentGifters
+        : global.highlightRecentGifters,
+    recentGifterMinDiamonds:
+      typeof override.recentGifterMinDiamonds === 'number'
+        ? override.recentGifterMinDiamonds
+        : global.recentGifterMinDiamonds,
+    recentGifterWindowSeconds:
+      typeof override.recentGifterWindowSeconds === 'number'
+        ? override.recentGifterWindowSeconds
+        : global.recentGifterWindowSeconds,
+  };
+}
+
+/** Resolve effective alert settings: per-stream overrides replace when set. */
+export function resolveAlertSettings(
+  global: AlertSettings,
+  overrides?: AlertSettingsOverrides | null,
+): AlertSettings {
+  const o = overrides ?? {};
+  const keywords = o.chatKeywordFlags;
+  return {
+    giftAlertRules: mergeGiftAlertRules(
+      global.giftAlertRules,
+      o.giftAlertRules,
+    ),
+    chatKeywordFlags:
+      keywords != null && keywords.length > 0
+        ? keywords
+        : global.chatKeywordFlags,
+    chatHighlights: mergeChatHighlights(
+      global.chatHighlights,
+      o.chatHighlights,
+    ),
+  };
+}
+
+/** True when stored config matches code defaults (migrate to inherit). */
+export function isDefaultAlertSettings(settings: AlertSettings): boolean {
+  const diamond = settings.giftAlertRules.find(isDiamondRule);
+  const named = settings.giftAlertRules.filter(isNamedGiftRule);
+  if (named.length > 0) return false;
+  if (
+    diamond &&
+    (diamond.minDiamondValue !== 100 || diamond.notify === false)
+  ) {
+    return false;
+  }
+  if (!diamond && settings.giftAlertRules.length > 0) return false;
+  if (settings.chatKeywordFlags.length > 0) return false;
+  const h = settings.chatHighlights;
+  if (h.highlightUsernames.length > 0) return false;
+  if (
+    h.highlightRecentGifters !== DEFAULT_CHAT_HIGHLIGHTS.highlightRecentGifters
+  ) {
+    return false;
+  }
+  if (
+    h.recentGifterMinDiamonds !==
+    DEFAULT_CHAT_HIGHLIGHTS.recentGifterMinDiamonds
+  ) {
+    return false;
+  }
+  if (
+    h.recentGifterWindowSeconds !==
+    DEFAULT_CHAT_HIGHLIGHTS.recentGifterWindowSeconds
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function parseNameDisplayMode(value: unknown): NameDisplayMode {
+  if (value === 'username' || value === 'nickname' || value === 'both') {
+    return value;
+  }
+  return DEFAULT_NAME_DISPLAY_MODE;
+}
+
 export interface RelayGiftEvent {
-  kind: "gift";
+  kind: 'gift';
   streamId: string;
   eventId: string;
   senderUsername: string | null;
+  senderNickname?: string | null;
   giftName: string | null;
   giftId: number | null;
   giftCount: number;
@@ -87,7 +245,7 @@ export interface RelayGiftEvent {
 }
 
 export interface RelayChatEvent {
-  kind: "chat";
+  kind: 'chat';
   streamId: string;
   eventId: string;
   username: string | null;
@@ -115,17 +273,19 @@ export interface ChatUserSignals {
 }
 
 export interface RelayRoomEvent {
-  kind: "room";
+  kind: 'room';
   streamId: string;
   eventId: string;
   type: RoomEventType;
   username: string | null;
+  nickname?: string | null;
+  /** Verb-only text (e.g. "followed"); person label is formatted client-side. */
   summary: string;
   createdAt: number;
 }
 
 export interface RelayStatusEvent {
-  kind: "status";
+  kind: 'status';
   streamId: string;
   status: ConnectionStatus;
   detail?: string;
@@ -133,7 +293,7 @@ export interface RelayStatusEvent {
 }
 
 export interface RelayDisconnectedEvent {
-  kind: "disconnected";
+  kind: 'disconnected';
   streamId: string;
   reason: string;
   createdAt: number;
@@ -148,12 +308,14 @@ export type RelayEvent =
 
 export interface QueueItemPayload {
   senderUsername?: string | null;
+  senderNickname?: string | null;
   giftName?: string | null;
   giftCount?: number;
   diamondValue?: number | null;
   targetUsername?: string | null;
   targetNickname?: string | null;
   username?: string | null;
+  nickname?: string | null;
   comment?: string;
   matchedRule?: string;
   matchedKeyword?: string;
@@ -186,6 +348,7 @@ export interface RoomLogItem {
   streamId: string;
   type: RoomEventType;
   username: string | null;
+  nickname: string | null;
   summary: string;
   createdAt: number;
 }
@@ -194,13 +357,14 @@ export interface GiftLogItem {
   id: string;
   streamId: string;
   senderUsername: string | null;
+  senderNickname: string | null;
   giftName: string | null;
   giftCount: number;
   diamondValue: number | null;
   targetUsername: string | null;
   targetNickname: string | null;
   /** none = logged only; pending/done = alert queue state */
-  alertStatus: "none" | QueueItemStatus;
+  alertStatus: 'none' | QueueItemStatus;
   queueItemId: string | null;
   matchedRule: string | null;
   createdAt: number;
@@ -212,6 +376,7 @@ export interface LiveFeed {
   statusDetail: string | null;
   isCheckedIn: boolean;
   chatHighlights: ChatHighlightConfig;
+  nameDisplayMode: NameDisplayMode;
   /** Gift names enabled in stream settings (feed pills), regardless of notify. */
   enabledGiftNames: string[];
   chat: ChatLogItem[];
@@ -238,38 +403,76 @@ export function giftDiamondSpend(
   diamondValue: number | null | undefined,
   giftCount: number | null | undefined,
 ): number {
-  if (typeof diamondValue !== "number") return 0;
+  if (typeof diamondValue !== 'number') return 0;
   const count = giftCount && giftCount > 0 ? giftCount : 1;
   return diamondValue * count;
+}
+
+/**
+ * Format a person for UI / push.
+ * - username: @handle
+ * - nickname: display name, fall back to @handle
+ * - both: "Jane @jane123" when they differ; else @handle
+ */
+export function formatPersonLabel(
+  username: string | null | undefined,
+  nickname: string | null | undefined,
+  mode: NameDisplayMode = DEFAULT_NAME_DISPLAY_MODE,
+  fallback = 'someone',
+): string {
+  const handle = username?.trim() || null;
+  const nick = nickname?.trim() || null;
+  const atHandle = handle ? `@${handle}` : null;
+
+  if (mode === 'username') {
+    return atHandle ?? nick ?? fallback;
+  }
+  if (mode === 'nickname') {
+    return nick ?? atHandle ?? fallback;
+  }
+  // both
+  if (handle && nick && nick.toLowerCase() !== handle.toLowerCase()) {
+    return `${nick} ${atHandle}`;
+  }
+  return atHandle ?? nick ?? fallback;
 }
 
 export function formatGiftTarget(
   username: string | null | undefined,
   nickname?: string | null,
+  mode: NameDisplayMode = DEFAULT_NAME_DISPLAY_MODE,
 ): string | null {
   const handle = username?.trim() || null;
   const nick = nickname?.trim() || null;
   if (!handle && !nick) return null;
-  if (handle && nick && nick.toLowerCase() !== handle.toLowerCase()) {
-    return `${nick} @${handle}`;
-  }
-  return handle ? `@${handle}` : nick;
+  return formatPersonLabel(username, nickname, mode, nick ?? `@${handle}`);
 }
 
-export function formatGiftAlertBody(input: {
-  senderUsername: string | null;
-  giftName: string | null;
-  giftCount: number;
-  diamondValue?: number | null;
-  targetUsername: string | null;
-  targetNickname?: string | null;
-}): string {
-  const sender = input.senderUsername ?? "someone";
-  const gift = input.giftName ?? "gift";
-  const to = formatGiftTarget(input.targetUsername, input.targetNickname);
-  const toPart = to ? ` to ${to}` : "";
+export function formatGiftAlertBody(
+  input: {
+    senderUsername: string | null;
+    senderNickname?: string | null;
+    giftName: string | null;
+    giftCount: number;
+    diamondValue?: number | null;
+    targetUsername: string | null;
+    targetNickname?: string | null;
+  },
+  mode: NameDisplayMode = DEFAULT_NAME_DISPLAY_MODE,
+): string {
+  const sender = formatPersonLabel(
+    input.senderUsername,
+    input.senderNickname,
+    mode,
+    'someone',
+  );
+  const gift = input.giftName ?? 'gift';
+  const to = formatGiftTarget(input.targetUsername, input.targetNickname, mode);
+  const toPart = to ? ` to ${to}` : '';
   const spend = giftDiamondSpend(input.diamondValue, input.giftCount);
   const valuePart =
-    typeof input.diamondValue === "number" ? ` ${spend}◆` : ` ×${input.giftCount}`;
-  return `@${sender} sent ${gift}${valuePart}${toPart}`;
+    typeof input.diamondValue === 'number'
+      ? ` ${spend}◆`
+      : ` ×${input.giftCount}`;
+  return `${sender} sent ${gift}${valuePart}${toPart}`;
 }

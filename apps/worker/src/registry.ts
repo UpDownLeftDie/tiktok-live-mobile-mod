@@ -1,14 +1,31 @@
 import type {
+  ChatHighlightConfig,
   CheckedInStream,
+  GiftAlertRule,
   GiftCatalogItem,
+  GlobalSettings,
   PushNotificationPayload,
 } from '@tiktok-mod/shared';
-import { dedupeGiftCatalogByName, GIFT_CATALOG } from '@tiktok-mod/shared';
+import {
+  DEFAULT_CHAT_HIGHLIGHTS,
+  DEFAULT_CHAT_KEYWORDS,
+  DEFAULT_GIFT_ALERT_RULES,
+  DEFAULT_GLOBAL_SETTINGS,
+  dedupeGiftCatalogByName,
+  GIFT_CATALOG,
+  parseNameDisplayMode,
+} from '@tiktok-mod/shared';
+import { parseClientId } from './auth';
 import type { Env } from './env';
 import { sendWebPush, type StoredSubscription } from './push';
 
+/** Ephemeral watchers expire if the PWA stops heartbeating. Sticky check-ins do not. */
+const PRESENCE_TTL_MS = 20_000;
+const MIGRATED_CLIENT_ID = 'migrated';
+
 /**
- * App-wide Durable Object: checked-in set, known streams list, push subscriptions.
+ * App-wide Durable Object: checked-in set, known streams list, push subscriptions,
+ * gift catalog, and global alert defaults.
  */
 export class Registry implements DurableObject {
   private readonly env: Env;
@@ -50,7 +67,48 @@ export class Registry implements DurableObject {
         gifts_json TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS global_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        gift_alert_rules TEXT NOT NULL,
+        chat_keyword_flags TEXT NOT NULL,
+        chat_highlights TEXT NOT NULL,
+        name_display_mode TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS check_in_watchers (
+        stream_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        sticky INTEGER NOT NULL DEFAULT 1,
+        last_seen_at INTEGER NOT NULL,
+        PRIMARY KEY (stream_id, client_id)
+      );
     `);
+    this.ensureGlobalSettingsRow();
+    this.migrateCheckedInToWatchers();
+  }
+
+  /** Existing stream-level check-ins become a sticky placeholder until a real device claims them. */
+  private migrateCheckedInToWatchers(): void {
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO check_in_watchers (stream_id, client_id, sticky, last_seen_at)
+       SELECT stream_id, ?, 1, checked_in_at FROM checked_in`,
+      MIGRATED_CLIENT_ID,
+    );
+  }
+
+  private ensureGlobalSettingsRow(): void {
+    const existing = this.ctx.storage.sql
+      .exec<{ id: number }>('SELECT id FROM global_settings WHERE id = 1')
+      .toArray();
+    if (existing.length > 0) return;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO global_settings (
+         id, gift_alert_rules, chat_keyword_flags, chat_highlights, name_display_mode
+       ) VALUES (1, ?, ?, ?, ?)`,
+      JSON.stringify(DEFAULT_GIFT_ALERT_RULES),
+      JSON.stringify(DEFAULT_CHAT_KEYWORDS),
+      JSON.stringify(DEFAULT_CHAT_HIGHLIGHTS),
+      DEFAULT_GLOBAL_SETTINGS.nameDisplayMode,
+    );
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -65,8 +123,10 @@ export class Registry implements DurableObject {
         return this.checkIn(request);
       case 'POST /check-out':
         return this.checkOut(request);
+      case 'POST /presence':
+        return this.touchPresence(request);
       case 'GET /streams':
-        return this.listStreams();
+        return this.listStreams(request);
       case 'POST /streams':
         return this.addStream(request);
       case 'POST /subscribe':
@@ -81,6 +141,10 @@ export class Registry implements DurableObject {
         return this.getGiftCatalog();
       case 'PUT /gift-catalog':
         return this.putGiftCatalog(request);
+      case 'GET /global-settings':
+        return Response.json(this.getGlobalSettings());
+      case 'PUT /global-settings':
+        return this.putGlobalSettings(request);
       default:
         break;
     }
@@ -91,73 +155,235 @@ export class Registry implements DurableObject {
     return Response.json({ error: 'not found' }, { status: 404 });
   }
 
-  private listCheckedIn(): Response {
-    const rows = this.ctx.storage.sql
+  private getGlobalSettings(): GlobalSettings {
+    this.ensureGlobalSettingsRow();
+    const row = this.ctx.storage.sql
       .exec<{
-        stream_id: string;
-        checked_in_at: number;
-      }>(
-        'SELECT stream_id, checked_in_at FROM checked_in ORDER BY checked_in_at ASC',
-      )
-      .toArray();
-    const streams: CheckedInStream[] = rows.map((r) => ({
-      streamId: r.stream_id,
-      checkedInAt: r.checked_in_at,
-    }));
+        gift_alert_rules: string;
+        chat_keyword_flags: string;
+        chat_highlights: string;
+        name_display_mode: string;
+      }>('SELECT * FROM global_settings WHERE id = 1')
+      .one();
+
+    let giftAlertRules: GiftAlertRule[];
+    let chatKeywordFlags: string[];
+    let chatHighlights: ChatHighlightConfig;
+    try {
+      giftAlertRules = JSON.parse(row.gift_alert_rules) as GiftAlertRule[];
+    } catch {
+      giftAlertRules = DEFAULT_GIFT_ALERT_RULES;
+    }
+    try {
+      chatKeywordFlags = JSON.parse(row.chat_keyword_flags) as string[];
+    } catch {
+      chatKeywordFlags = DEFAULT_CHAT_KEYWORDS;
+    }
+    try {
+      chatHighlights = {
+        ...DEFAULT_CHAT_HIGHLIGHTS,
+        ...(JSON.parse(row.chat_highlights) as ChatHighlightConfig),
+      };
+    } catch {
+      chatHighlights = { ...DEFAULT_CHAT_HIGHLIGHTS };
+    }
+
+    return {
+      giftAlertRules: Array.isArray(giftAlertRules)
+        ? giftAlertRules
+        : DEFAULT_GIFT_ALERT_RULES,
+      chatKeywordFlags: Array.isArray(chatKeywordFlags)
+        ? chatKeywordFlags
+        : DEFAULT_CHAT_KEYWORDS,
+      chatHighlights,
+      nameDisplayMode: parseNameDisplayMode(row.name_display_mode),
+    };
+  }
+
+  private async putGlobalSettings(request: Request): Promise<Response> {
+    this.ensureGlobalSettingsRow();
+    const body = (await request.json()) as Partial<GlobalSettings>;
+    const current = this.getGlobalSettings();
+
+    const giftAlertRules = Array.isArray(body.giftAlertRules)
+      ? body.giftAlertRules
+      : current.giftAlertRules;
+    const chatKeywordFlags = Array.isArray(body.chatKeywordFlags)
+      ? body.chatKeywordFlags
+      : current.chatKeywordFlags;
+    const chatHighlights = body.chatHighlights
+      ? {
+          ...DEFAULT_CHAT_HIGHLIGHTS,
+          ...body.chatHighlights,
+          highlightUsernames: (body.chatHighlights.highlightUsernames ?? [])
+            .map((u) => u.trim().replace(/^@/, ''))
+            .filter(Boolean),
+        }
+      : current.chatHighlights;
+    const nameDisplayMode =
+      body.nameDisplayMode != null
+        ? parseNameDisplayMode(body.nameDisplayMode)
+        : current.nameDisplayMode;
+
+    this.ctx.storage.sql.exec(
+      `UPDATE global_settings SET
+         gift_alert_rules = ?,
+         chat_keyword_flags = ?,
+         chat_highlights = ?,
+         name_display_mode = ?
+       WHERE id = 1`,
+      JSON.stringify(giftAlertRules),
+      JSON.stringify(chatKeywordFlags),
+      JSON.stringify(chatHighlights),
+      nameDisplayMode,
+    );
+
+    return Response.json(this.getGlobalSettings());
+  }
+
+  private async listCheckedIn(): Promise<Response> {
+    const before = this.activeStreamIdSet();
+    this.pruneExpiredWatchers();
+    const after = this.activeStreamIdSet();
+    this.ctx.waitUntil(this.syncStreamSessions(before, after));
+
+    const streams: CheckedInStream[] = [...after]
+      .sort()
+      .map((streamId) => ({
+        streamId,
+        checkedInAt: this.earliestWatcherSeen(streamId),
+      }));
     return Response.json({ streams });
   }
 
   private async checkIn(request: Request): Promise<Response> {
-    const body = (await request.json()) as { streamId: string };
+    const body = (await request.json()) as {
+      streamId?: string;
+      clientId?: unknown;
+    };
     if (!body.streamId) {
       return Response.json({ error: 'streamId required' }, { status: 400 });
     }
-    this.ctx.storage.sql.exec(
-      `INSERT INTO checked_in (stream_id, checked_in_at) VALUES (?, ?)
-       ON CONFLICT(stream_id) DO UPDATE SET checked_in_at = excluded.checked_in_at`,
-      body.streamId,
-      Date.now(),
-    );
+    const clientId = parseClientId(body.clientId);
+    if (!clientId) {
+      return Response.json({ error: 'clientId required' }, { status: 400 });
+    }
+    this.upsertWatcher(body.streamId, clientId, true);
     this.ctx.storage.sql.exec(
       `INSERT INTO streams (stream_id, added_at) VALUES (?, ?)
        ON CONFLICT(stream_id) DO NOTHING`,
       body.streamId,
       Date.now(),
     );
-    return Response.json({ ok: true });
+    this.syncCheckedInRow(body.streamId);
+    return Response.json(this.watcherStatus(body.streamId, clientId));
   }
 
   private async checkOut(request: Request): Promise<Response> {
-    const body = (await request.json()) as { streamId: string };
+    const body = (await request.json()) as {
+      streamId?: string;
+      clientId?: unknown;
+      force?: unknown;
+    };
     if (!body.streamId) {
       return Response.json({ error: 'streamId required' }, { status: 400 });
     }
-    this.ctx.storage.sql.exec(
-      'DELETE FROM checked_in WHERE stream_id = ?',
-      body.streamId,
-    );
-    return Response.json({ ok: true });
+    const clientId = parseClientId(body.clientId);
+    if (!clientId) {
+      return Response.json({ error: 'clientId required' }, { status: 400 });
+    }
+    if (body.force === true) {
+      this.ctx.storage.sql.exec(
+        'DELETE FROM check_in_watchers WHERE stream_id = ?',
+        body.streamId,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        'DELETE FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
+        body.streamId,
+        clientId,
+      );
+    }
+    this.pruneExpiredWatchers();
+    this.syncCheckedInRow(body.streamId);
+    return Response.json(this.watcherStatus(body.streamId, clientId));
   }
 
-  private listStreams(): Response {
+  private async touchPresence(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      clientId?: unknown;
+      streamIds?: unknown;
+    };
+    const clientId = parseClientId(body.clientId);
+    if (!clientId) {
+      return Response.json({ error: 'clientId required' }, { status: 400 });
+    }
+    const streamIds = Array.isArray(body.streamIds)
+      ? body.streamIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : [];
+
+    const before = this.activeStreamIdSet();
+    this.pruneExpiredWatchers();
+
+    if (streamIds.length === 0) {
+      this.ctx.storage.sql.exec(
+        'DELETE FROM check_in_watchers WHERE client_id = ? AND sticky = 0',
+        clientId,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        `DELETE FROM check_in_watchers
+         WHERE client_id = ? AND sticky = 0 AND stream_id NOT IN (${streamIds
+           .map(() => '?')
+           .join(', ')})`,
+        clientId,
+        ...streamIds,
+      );
+    }
+
+    for (const streamId of streamIds) {
+      if (this.watcherCount(streamId) === 0) continue;
+      this.upsertWatcher(streamId, clientId, false);
+    }
+
+    this.pruneExpiredWatchers();
+    const after = this.activeStreamIdSet();
+    this.ctx.waitUntil(this.syncStreamSessions(before, after));
+    for (const streamId of new Set([...before, ...after, ...streamIds])) {
+      this.syncCheckedInRow(streamId);
+    }
+
+    return Response.json({ ok: true, streams: [...after] });
+  }
+
+  private async listStreams(request: Request): Promise<Response> {
+    const before = this.activeStreamIdSet();
+    this.pruneExpiredWatchers();
+    const after = this.activeStreamIdSet();
+    this.ctx.waitUntil(this.syncStreamSessions(before, after));
+    for (const streamId of new Set([...before, ...after])) {
+      this.syncCheckedInRow(streamId);
+    }
+
+    const clientId = parseClientId(new URL(request.url).searchParams.get('clientId'));
     const rows = this.ctx.storage.sql
       .exec<{
         stream_id: string;
         added_at: number;
       }>('SELECT stream_id, added_at FROM streams ORDER BY added_at ASC')
       .toArray();
-    const checked = new Set(
-      this.ctx.storage.sql
-        .exec<{ stream_id: string }>('SELECT stream_id FROM checked_in')
-        .toArray()
-        .map((r) => r.stream_id),
-    );
+    const watchers = this.watchersByStream();
     return Response.json({
-      streams: rows.map((r) => ({
-        streamId: r.stream_id,
-        addedAt: r.added_at,
-        isCheckedIn: checked.has(r.stream_id),
-      })),
+      streams: rows.map((r) => {
+        const set = watchers.get(r.stream_id);
+        return {
+          streamId: r.stream_id,
+          addedAt: r.added_at,
+          isCheckedIn: Boolean(set && set.size > 0),
+          watcherCount: set?.size ?? 0,
+          youAreWatching: Boolean(clientId && set?.has(clientId)),
+        };
+      }),
     });
   }
 
@@ -176,8 +402,9 @@ export class Registry implements DurableObject {
     return Response.json({ ok: true, streamId });
   }
 
-  private removeStream(path: string): Response {
+  private async removeStream(path: string): Promise<Response> {
     const streamId = decodeURIComponent(path.slice('/streams/'.length));
+    const wasActive = this.activeStreamIdSet().has(streamId);
     this.ctx.storage.sql.exec(
       'DELETE FROM streams WHERE stream_id = ?',
       streamId,
@@ -186,7 +413,192 @@ export class Registry implements DurableObject {
       'DELETE FROM checked_in WHERE stream_id = ?',
       streamId,
     );
+    this.ctx.storage.sql.exec(
+      'DELETE FROM check_in_watchers WHERE stream_id = ?',
+      streamId,
+    );
+    if (wasActive) {
+      this.ctx.waitUntil(this.notifyStreamCheckedIn(streamId, false));
+    }
     return Response.json({ ok: true });
+  }
+
+  private pruneExpiredWatchers(): void {
+    this.ctx.storage.sql.exec(
+      'DELETE FROM check_in_watchers WHERE sticky = 0 AND last_seen_at < ?',
+      Date.now() - PRESENCE_TTL_MS,
+    );
+  }
+
+  /** First real device to touch a pre-migration check-in inherits the sticky slot. */
+  private takeMigratedSticky(streamId: string): boolean {
+    const row = this.ctx.storage.sql
+      .exec<{ n: number }>(
+        'SELECT COUNT(*) AS n FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
+        streamId,
+        MIGRATED_CLIENT_ID,
+      )
+      .one();
+    if (row.n === 0) return false;
+    this.ctx.storage.sql.exec(
+      'DELETE FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
+      streamId,
+      MIGRATED_CLIENT_ID,
+    );
+    return true;
+  }
+
+  private upsertWatcher(
+    streamId: string,
+    clientId: string,
+    sticky: boolean,
+  ): void {
+    const inherited = this.takeMigratedSticky(streamId);
+    const makeSticky = sticky || inherited ? 1 : 0;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO check_in_watchers (stream_id, client_id, sticky, last_seen_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(stream_id, client_id) DO UPDATE SET
+         last_seen_at = excluded.last_seen_at,
+         sticky = CASE
+           WHEN check_in_watchers.sticky > excluded.sticky
+           THEN check_in_watchers.sticky
+           ELSE excluded.sticky
+         END`,
+      streamId,
+      clientId,
+      makeSticky,
+      Date.now(),
+    );
+  }
+
+  private watcherCount(streamId: string): number {
+    return this.ctx.storage.sql
+      .exec<{ n: number }>(
+        'SELECT COUNT(*) AS n FROM check_in_watchers WHERE stream_id = ?',
+        streamId,
+      )
+      .one().n;
+  }
+
+  private watcherStatus(
+    streamId: string,
+    clientId: string,
+  ): {
+    ok: true;
+    streamId: string;
+    isCheckedIn: boolean;
+    watcherCount: number;
+    youAreWatching: boolean;
+  } {
+    const count = this.watcherCount(streamId);
+    const you = this.ctx.storage.sql
+      .exec<{ n: number }>(
+        'SELECT COUNT(*) AS n FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
+        streamId,
+        clientId,
+      )
+      .one().n;
+    return {
+      ok: true,
+      streamId,
+      isCheckedIn: count > 0,
+      watcherCount: count,
+      youAreWatching: you > 0,
+    };
+  }
+
+  private activeStreamIdSet(): Set<string> {
+    return new Set(
+      this.ctx.storage.sql
+        .exec<{ stream_id: string }>(
+          'SELECT DISTINCT stream_id FROM check_in_watchers',
+        )
+        .toArray()
+        .map((r) => r.stream_id),
+    );
+  }
+
+  private earliestWatcherSeen(streamId: string): number {
+    const row = this.ctx.storage.sql
+      .exec<{ t: number | null }>(
+        'SELECT MIN(last_seen_at) AS t FROM check_in_watchers WHERE stream_id = ?',
+        streamId,
+      )
+      .one();
+    return row.t ?? Date.now();
+  }
+
+  private watchersByStream(): Map<string, Set<string>> {
+    const map = new Map<string, Set<string>>();
+    const rows = this.ctx.storage.sql
+      .exec<{ stream_id: string; client_id: string }>(
+        'SELECT stream_id, client_id FROM check_in_watchers',
+      )
+      .toArray();
+    for (const row of rows) {
+      let set = map.get(row.stream_id);
+      if (!set) {
+        set = new Set();
+        map.set(row.stream_id, set);
+      }
+      set.add(row.client_id);
+    }
+    return map;
+  }
+
+  private syncCheckedInRow(streamId: string): void {
+    const count = this.watcherCount(streamId);
+    if (count === 0) {
+      this.ctx.storage.sql.exec(
+        'DELETE FROM checked_in WHERE stream_id = ?',
+        streamId,
+      );
+      return;
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO checked_in (stream_id, checked_in_at) VALUES (?, ?)
+       ON CONFLICT(stream_id) DO NOTHING`,
+      streamId,
+      Date.now(),
+    );
+  }
+
+  private async syncStreamSessions(
+    before: Set<string>,
+    after: Set<string>,
+  ): Promise<void> {
+    for (const streamId of after) {
+      if (!before.has(streamId)) {
+        await this.notifyStreamCheckedIn(streamId, true);
+      }
+    }
+    for (const streamId of before) {
+      if (!after.has(streamId)) {
+        await this.notifyStreamCheckedIn(streamId, false);
+      }
+    }
+  }
+
+  private async notifyStreamCheckedIn(
+    streamId: string,
+    isCheckedIn: boolean,
+  ): Promise<void> {
+    try {
+      const id = this.env.STREAM_SESSION.idFromName(streamId);
+      await this.env.STREAM_SESSION.get(id).fetch(
+        new Request(
+          `https://do/sync-check?streamId=${encodeURIComponent(streamId)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ isCheckedIn }),
+          },
+        ),
+      );
+    } catch (err) {
+      console.error('notifyStreamCheckedIn failed', streamId, err);
+    }
   }
 
   private async subscribe(request: Request): Promise<Response> {

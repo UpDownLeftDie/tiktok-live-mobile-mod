@@ -212,26 +212,23 @@ export class StreamWatcher {
 
     connection.on(WebcastEvent.FOLLOW, (data) => {
       const d = data as RoomEventLike;
-      const who = d.user?.uniqueId || d.user?.displayId || 'someone';
-      this.postRoom('follow', d, `@${who} followed`);
+      this.postRoom('follow', d, 'followed');
     });
 
     connection.on(WebcastEvent.SHARE, (data) => {
       const d = data as RoomEventLike;
-      const who = d.user?.uniqueId || d.user?.displayId || 'someone';
-      this.postRoom('share', d, `@${who} shared the stream`);
+      this.postRoom('share', d, 'shared the stream');
     });
 
     connection.on(WebcastEvent.MEMBER, (data) => {
       const d = data as RoomEventLike;
-      const who = d.user?.uniqueId || d.user?.displayId || "someone";
-      this.postRoom("member", d, `@${who} joined`);
+      this.postRoom('member', d, 'joined');
     });
 
     // Skip WebcastEvent.LIKE — too noisy for the events column.
 
     connection.on(WebcastEvent.STREAM_END, () => {
-      this.postRoom("stream_end", {}, "Stream ended");
+      this.postRoom('stream_end', {}, 'Stream ended');
     });
 
     await connection.connect();

@@ -1,15 +1,15 @@
 import {
+  DEFAULT_NAME_DISPLAY_MODE,
   formatGiftTarget,
-  dedupeGiftCatalogByName,
+  formatPersonLabel,
   giftDiamondSpend,
   type ChatHighlightConfig,
   type ChatLogItem,
   type ChatUserSignals,
   type ConnectionStatus,
-  type GiftAlertRule,
-  type GiftCatalogItem,
   type GiftLogItem,
   type LiveFeed,
+  type NameDisplayMode,
   type RoomEventType,
   type RoomLogItem,
 } from '@tiktok-mod/shared';
@@ -27,8 +27,6 @@ import {
   checkOut,
   DEFAULT_CHAT_HIGHLIGHTS,
   fetchPublicConfig,
-  getConfig,
-  getGiftCatalog,
   getLiveFeed,
   getPasscode,
   listStreams,
@@ -37,7 +35,7 @@ import {
   markGiftPending,
   markGiftsDone,
   markGiftsPending,
-  putConfig,
+  pingPresence,
   removeStream,
   setPasscode,
   statusLabel,
@@ -45,12 +43,7 @@ import {
   testPush,
   urlBase64ToUint8Array,
 } from './api';
-
-type StreamRow = {
-  streamId: string;
-  addedAt: number;
-  isCheckedIn: boolean;
-};
+import { StreamsPanel, type StreamRow } from './StreamSettings';
 
 type Tab = 'live' | 'streams' | 'settings';
 
@@ -166,13 +159,7 @@ function giftMatchesFeedFilter(
   return Boolean(name && activeTypes.has(name));
 }
 
-type ChatFilterKind =
-  | 'flagged'
-  | 'watch'
-  | 'gifter'
-  | 'mod'
-  | 'sub'
-  | 'follow';
+type ChatFilterKind = 'flagged' | 'watch' | 'gifter' | 'mod' | 'sub' | 'follow';
 
 const CHAT_FILTER_TYPES: { type: ChatFilterKind; label: string }[] = [
   { type: 'flagged', label: 'Flagged' },
@@ -236,6 +223,7 @@ const EMPTY_FEED: LiveFeed = {
   statusDetail: null,
   isCheckedIn: false,
   chatHighlights: DEFAULT_CHAT_HIGHLIGHTS,
+  nameDisplayMode: DEFAULT_NAME_DISPLAY_MODE,
   enabledGiftNames: [],
   chat: [],
   events: [],
@@ -455,6 +443,19 @@ function ModApp(
     }
   }, [selected, handleUnauthorized]);
 
+  const tick = useCallback(async () => {
+    try {
+      await pingPresence(selected ? [selected] : []);
+    } catch (err) {
+      if (isUnauthorized(err)) {
+        handleUnauthorized();
+        return;
+      }
+    }
+    await refreshStreams().catch(() => undefined);
+    await refreshLive().catch(() => undefined);
+  }, [selected, handleUnauthorized, refreshStreams, refreshLive]);
+
   useEffect(() => {
     const fromUrl = new URLSearchParams(window.location.search).get('stream');
     if (fromUrl) {
@@ -467,13 +468,12 @@ function ModApp(
   }, [refreshStreams]);
 
   useEffect(() => {
-    void refreshLive().catch(() => undefined);
+    void tick().catch(() => undefined);
     const id = window.setInterval(() => {
-      void refreshLive().catch(() => undefined);
-      void refreshStreams().catch(() => undefined);
+      void tick().catch(() => undefined);
     }, 2500);
     return () => window.clearInterval(id);
-  }, [refreshLive, refreshStreams]);
+  }, [tick]);
 
   async function withBusy(fn: () => Promise<void>) {
     setBusy(true);
@@ -525,9 +525,6 @@ function ModApp(
       <header className="header">
         <div>
           <p className="brand">Live Mod</p>
-          <p className="sub">
-            {selected ? `@${selected}` : 'TikTok LIVE alerts — phone-first'}
-          </p>
         </div>
         <StatusChip
           status={status}
@@ -553,8 +550,10 @@ function ModApp(
         {tab === 'live' ? (
           <LivePanel
             selected={selected}
+            streams={streams}
             feed={feed}
             busy={busy}
+            onSelect={setSelected}
             onDone={(queueItemId) =>
               void withBusy(async () => {
                 if (!selected) return;
@@ -623,6 +622,17 @@ function ModApp(
             onCheckOut={(id) =>
               void withBusy(async () => {
                 await checkOut(id);
+                await refreshStreams();
+                await refreshLive();
+              })
+            }
+            onStopAll={(id) =>
+              void withBusy(async () => {
+                const ok = window.confirm(
+                  `Disconnect @${id} for everyone? This stops the live watch on all devices.`,
+                );
+                if (!ok) return;
+                await checkOut(id, { force: true });
                 await refreshStreams();
                 await refreshLive();
               })
@@ -701,8 +711,10 @@ function StatusChip(
 function LivePanel(
   props: Readonly<{
     selected: string | null;
+    streams: StreamRow[];
     feed: LiveFeed;
     busy: boolean;
+    onSelect: (streamId: string) => void;
     onDone: (queueItemId: string) => void;
     onGiftDone: (giftId: string) => void;
     onGiftUndo: (giftId: string) => void;
@@ -722,8 +734,15 @@ function LivePanel(
   );
   const [bulkUndoIds, setBulkUndoIds] = useState<string[]>([]);
 
+  const checkedInStreams = useMemo(
+    () => props.streams.filter((s) => s.isCheckedIn),
+    [props.streams],
+  );
+
   const enabledGiftNames = props.feed.enabledGiftNames ?? [];
-  const enabledGiftKey = enabledGiftNames.map((n) => n.toLowerCase()).join('\0');
+  const enabledGiftKey = enabledGiftNames
+    .map((n) => n.toLowerCase())
+    .join('\0');
 
   useEffect(() => {
     if (!props.selected) return;
@@ -779,6 +798,17 @@ function LivePanel(
     });
   }
 
+  function toggleAllGiftTypes() {
+    if (!props.selected) return;
+    const allKeys = enabledGiftNames.map((n) => n.toLowerCase());
+    setGiftTypeFilters((prev) => {
+      const allOn = allKeys.length > 0 && allKeys.every((k) => prev.has(k));
+      const next = allOn ? new Set<string>() : new Set(allKeys);
+      saveGiftTypeFilters(props.selected!, next, enabledGiftNames);
+      return next;
+    });
+  }
+
   if (!props.selected) {
     return (
       <section className="panel">
@@ -809,12 +839,38 @@ function LivePanel(
   const filteredGifts = props.feed.gifts.filter((g) =>
     giftMatchesFeedFilter(g, giftMinDiamonds, giftTypeFilters),
   );
-  const importantTypes = new Set(
-    enabledGiftNames.map((n) => n.toLowerCase()),
-  );
+  const importantTypes = new Set(enabledGiftNames.map((n) => n.toLowerCase()));
 
   return (
     <section className="panel live-panel">
+      {checkedInStreams.length > 0 ? (
+        <div
+          className="live-stream-switcher"
+          role="tablist"
+          aria-label="Checked-in streams">
+          <div className="pill-row live-stream-pills">
+            {checkedInStreams.map((s) => {
+              const active = props.selected === s.streamId;
+              return (
+                <button
+                  key={s.streamId}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  className={active ? 'pill active' : 'pill'}
+                  disabled={props.busy && !active}
+                  onClick={() => props.onSelect(s.streamId)}>
+                  @{s.streamId}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <p className="muted note live-stream-switcher-empty">
+          No streams checked in. Check in from Streams to watch a feed.
+        </p>
+      )}
       <div className="live-layout">
         <FeedColumn
           title="Gifts"
@@ -834,6 +890,18 @@ function LivePanel(
               </label>
               {enabledGiftNames.length > 0 ? (
                 <div className="pill-row">
+                  <button
+                    type="button"
+                    className={
+                      enabledGiftNames.every((n) =>
+                        giftTypeFilters.has(n.toLowerCase()),
+                      )
+                        ? 'pill active'
+                        : 'pill'
+                    }
+                    onClick={() => toggleAllGiftTypes()}>
+                    All
+                  </button>
                   {enabledGiftNames.map((name) => (
                     <button
                       key={name.toLowerCase()}
@@ -860,6 +928,9 @@ function LivePanel(
             }
             importantTypes={importantTypes}
             hostUsername={props.selected}
+            nameDisplayMode={
+              props.feed.nameDisplayMode ?? DEFAULT_NAME_DISPLAY_MODE
+            }
             busy={props.busy}
             bulkUndoIds={bulkUndoIds}
             onDone={(giftId) => {
@@ -894,9 +965,7 @@ function LivePanel(
                   <button
                     key={f.type}
                     type="button"
-                    className={
-                      chatFilters.has(f.type) ? 'pill active' : 'pill'
-                    }
+                    className={chatFilters.has(f.type) ? 'pill active' : 'pill'}
                     onClick={() => toggleChatFilter(f.type)}>
                     {f.label}
                   </button>
@@ -907,6 +976,9 @@ function LivePanel(
               items={filteredChat}
               gifts={props.feed.gifts}
               highlights={highlights}
+              nameDisplayMode={
+                props.feed.nameDisplayMode ?? DEFAULT_NAME_DISPLAY_MODE
+              }
               empty={
                 props.feed.chat.length === 0
                   ? 'No chat yet.'
@@ -936,7 +1008,12 @@ function LivePanel(
                 ))}
               </div>
             }>
-            <EventList items={filteredEvents} />
+            <EventList
+              items={filteredEvents}
+              nameDisplayMode={
+                props.feed.nameDisplayMode ?? DEFAULT_NAME_DISPLAY_MODE
+              }
+            />
           </FeedColumn>
         </div>
       </div>
@@ -975,7 +1052,10 @@ function recentGifterUsernames(
   const windowMs = highlights.recentGifterWindowSeconds * 1000;
   for (const g of gifts) {
     if (!g.senderUsername) continue;
-    if (giftDiamondSpend(g.diamondValue, g.giftCount) < highlights.recentGifterMinDiamonds)
+    if (
+      giftDiamondSpend(g.diamondValue, g.giftCount) <
+      highlights.recentGifterMinDiamonds
+    )
       continue;
     if (atTime - g.createdAt > windowMs || atTime < g.createdAt) continue;
     names.add(g.senderUsername.toLowerCase());
@@ -988,6 +1068,7 @@ function ChatList(
     items: ChatLogItem[];
     gifts: GiftLogItem[];
     highlights: ChatHighlightConfig;
+    nameDisplayMode: NameDisplayMode;
     empty?: string;
     busy: boolean;
     onDone: (queueItemId: string) => void;
@@ -1000,9 +1081,7 @@ function ChatList(
   );
 
   if (props.items.length === 0) {
-    return (
-      <p className="muted feed-empty">{props.empty ?? 'No chat yet.'}</p>
-    );
+    return <p className="muted feed-empty">{props.empty ?? 'No chat yet.'}</p>;
   }
   return (
     <div className="feed-inner">
@@ -1032,10 +1111,12 @@ function ChatList(
             <FeedTime at={item.createdAt} />
             <div className="feed-line-main">
               <span className="chat-user">
-                {item.userSignals?.nickname
-                  ? `${item.userSignals.nickname} `
-                  : null}
-                @{item.username ?? 'anon'}
+                {formatPersonLabel(
+                  item.username,
+                  item.userSignals?.nickname,
+                  props.nameDisplayMode,
+                  'anon',
+                )}
               </span>
               <ChatSignalTags signals={item.userSignals} />
               <span className="chat-body">{item.comment}</span>
@@ -1110,20 +1191,42 @@ function ChatSignalTags(props: Readonly<{ signals: ChatUserSignals | null }>) {
   );
 }
 
-function EventList(props: Readonly<{ items: RoomLogItem[] }>) {
+function EventList(
+  props: Readonly<{
+    items: RoomLogItem[];
+    nameDisplayMode: NameDisplayMode;
+  }>,
+) {
   if (props.items.length === 0) {
     return <p className="muted feed-empty">No matching events.</p>;
   }
   return (
     <div className="feed-inner">
-      {props.items.map((item) => (
-        <div key={item.id} className="feed-line">
-          <FeedTime at={item.createdAt} />
-          <div className="feed-line-main">
-            <span className="event-type">{item.type}</span> {item.summary}
+      {props.items.map((item) => {
+        const who =
+          item.username || item.nickname
+            ? formatPersonLabel(
+                item.username,
+                item.nickname,
+                props.nameDisplayMode,
+                'someone',
+              )
+            : null;
+        // Legacy events baked the handle into summary; prefer verb + label when we have identity.
+        const looksLegacy =
+          Boolean(who) &&
+          (item.summary.startsWith('@') || item.summary.startsWith(who!));
+        const text =
+          who && !looksLegacy ? `${who} ${item.summary}` : item.summary;
+        return (
+          <div key={item.id} className="feed-line">
+            <FeedTime at={item.createdAt} />
+            <div className="feed-line-main">
+              <span className="event-type">{item.type}</span> {text}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -1176,6 +1279,7 @@ function GiftLine(
     item: GiftLogItem;
     important: boolean;
     hostUsername: string | null;
+    nameDisplayMode: NameDisplayMode;
     busy: boolean;
     onDone: (giftId: string) => void;
     onUndo: (giftId: string) => void;
@@ -1188,6 +1292,7 @@ function GiftLine(
   const targetLabel = formatGiftTarget(
     item.targetUsername,
     item.targetNickname,
+    props.nameDisplayMode,
   );
   const spend =
     item.diamondValue == null
@@ -1207,10 +1312,18 @@ function GiftLine(
     <div className={className}>
       <FeedTime at={item.createdAt} />
       <div className="feed-line-main">
-        <span className="chat-user">@{item.senderUsername ?? 'someone'}</span>
+        <span className="chat-user">
+          {formatPersonLabel(
+            item.senderUsername,
+            item.senderNickname,
+            props.nameDisplayMode,
+            'someone',
+          )}
+        </span>
         <span className="chat-body">
           sent{' '}
-          <span className={props.important ? 'gift-name important' : 'gift-name'}>
+          <span
+            className={props.important ? 'gift-name important' : 'gift-name'}>
             {item.giftName ?? 'gift'}
           </span>
           {spend == null ? (
@@ -1260,6 +1373,7 @@ function GiftList(
     empty?: string;
     importantTypes: Set<string>;
     hostUsername: string | null;
+    nameDisplayMode: NameDisplayMode;
     busy: boolean;
     bulkUndoIds: string[];
     onDone: (giftId: string) => void;
@@ -1295,607 +1409,16 @@ function GiftList(
             item={item}
             important={Boolean(
               item.giftName &&
-                props.importantTypes.has(item.giftName.toLowerCase()),
+              props.importantTypes.has(item.giftName.toLowerCase()),
             )}
             hostUsername={props.hostUsername}
+            nameDisplayMode={props.nameDisplayMode}
             busy={props.busy}
             onDone={props.onDone}
             onUndo={props.onUndo}
           />
         ))
       )}
-    </div>
-  );
-}
-
-function StreamsPanel(
-  props: Readonly<{
-    streams: StreamRow[];
-    selected: string | null;
-    newStream: string;
-    busy: boolean;
-    onNewStreamChange: (v: string) => void;
-    onSelect: (id: string) => void;
-    onAdd: () => void;
-    onCheckIn: (id: string) => void;
-    onCheckOut: (id: string) => void;
-    onRemove: (id: string) => void;
-    onUnauthorized: () => void;
-    onStreamSettingsSaved: (streamId: string) => void;
-    withBusy: (fn: () => Promise<void>) => Promise<void>;
-  }>,
-) {
-  const [settingsStreamId, setSettingsStreamId] = useState<string | null>(null);
-
-  return (
-    <section className="panel">
-      <h1>Streams</h1>
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          props.onAdd();
-        }}>
-        <input
-          value={props.newStream}
-          onChange={(e) => props.onNewStreamChange(e.target.value)}
-          placeholder="tiktok username"
-          autoCapitalize="off"
-          autoCorrect="off"
-        />
-        <button type="submit" disabled={props.busy || !props.newStream.trim()}>
-          Add
-        </button>
-      </form>
-      <ul className="list">
-        {props.streams.map((s) => {
-          const settingsOpen = settingsStreamId === s.streamId;
-          return (
-            <li key={s.streamId} className="list-item">
-              <button
-                type="button"
-                className={
-                  props.selected === s.streamId
-                    ? 'stream-btn selected'
-                    : 'stream-btn'
-                }
-                onClick={() => props.onSelect(s.streamId)}>
-                <span>@{s.streamId}</span>
-                <span className="muted">
-                  {s.isCheckedIn ? 'checked in' : 'out'}
-                </span>
-              </button>
-              <div className="row tight">
-                {s.isCheckedIn ? (
-                  <button
-                    type="button"
-                    disabled={props.busy}
-                    onClick={() => props.onCheckOut(s.streamId)}>
-                    Check out
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="primary"
-                    disabled={props.busy}
-                    onClick={() => props.onCheckIn(s.streamId)}>
-                    Check in
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className={settingsOpen ? 'primary' : undefined}
-                  disabled={props.busy}
-                  onClick={() =>
-                    setSettingsStreamId((prev) =>
-                      prev === s.streamId ? null : s.streamId,
-                    )
-                  }>
-                  {settingsOpen ? 'Close' : 'Settings'}
-                </button>
-                <button
-                  type="button"
-                  className="danger"
-                  disabled={props.busy}
-                  onClick={() => props.onRemove(s.streamId)}>
-                  Remove
-                </button>
-              </div>
-              {settingsOpen ? (
-                <StreamSettingsEditor
-                  streamId={s.streamId}
-                  busy={props.busy}
-                  withBusy={props.withBusy}
-                  onUnauthorized={props.onUnauthorized}
-                  onSaved={() => props.onStreamSettingsSaved(s.streamId)}
-                />
-              ) : null}
-            </li>
-          );
-        })}
-      </ul>
-      {props.streams.length === 0 ? (
-        <p className="muted">Add a TikTok username to get started.</p>
-      ) : null}
-    </section>
-  );
-}
-
-function SwitchField(
-  props: Readonly<{
-    label: string;
-    checked: boolean;
-    onChange: (checked: boolean) => void;
-  }>,
-) {
-  return (
-    <label className="switch-field">
-      <span>{props.label}</span>
-      <span className="switch">
-        <input
-          type="checkbox"
-          role="switch"
-          checked={props.checked}
-          onChange={(e) => props.onChange(e.target.checked)}
-        />
-        <span className="switch-ui" aria-hidden />
-      </span>
-    </label>
-  );
-}
-
-type StreamSettingsValues = {
-  keywordsText: string;
-  minDiamonds: string;
-  notifyDiamonds: boolean;
-  catalogGifts: GiftCatalogItem[];
-  enabledGiftKeys: string[];
-  notifyGifts: boolean;
-  highlightUsersText: string;
-  highlightRecentGifters: boolean;
-  recentGifterMinDiamonds: string;
-  recentGifterWindowSeconds: string;
-};
-
-async function fetchStreamSettingsValues(
-  streamId: string,
-): Promise<StreamSettingsValues> {
-  const cfg = await getConfig(streamId);
-  const diamondRule = cfg.giftAlertRules.find(
-    (r) => typeof r.minDiamondValue === 'number' && !r.giftName,
-  );
-  const namedRules = cfg.giftAlertRules.filter((r) =>
-    Boolean(r.giftName?.trim()),
-  );
-  const enabledGiftKeys = namedRules
-    .map((r) => r.giftName?.trim().toLowerCase())
-    .filter((n): n is string => Boolean(n));
-  let fromCatalog: GiftCatalogItem[] = [];
-  try {
-    fromCatalog = (await getGiftCatalog()).gifts ?? [];
-  } catch {
-    fromCatalog = [];
-  }
-  const catalogKeys = new Set(fromCatalog.map((g) => g.name.toLowerCase()));
-  const extras: GiftCatalogItem[] = namedRules
-    .map((r) => r.giftName?.trim())
-    .filter((n): n is string => Boolean(n))
-    .filter((n) => !catalogKeys.has(n.toLowerCase()))
-    .map((name) => ({ id: null, name, diamondValue: null }));
-  const h = cfg.chatHighlights ?? DEFAULT_CHAT_HIGHLIGHTS;
-  return {
-    keywordsText: cfg.chatKeywordFlags.join('\n'),
-    minDiamonds: String(diamondRule?.minDiamondValue ?? 100),
-    notifyDiamonds: diamondRule?.notify !== false,
-    catalogGifts: dedupeGiftCatalogByName([...extras, ...fromCatalog]),
-    enabledGiftKeys,
-    notifyGifts:
-      namedRules.length === 0 || namedRules.some((r) => r.notify !== false),
-    highlightUsersText: h.highlightUsernames.join('\n'),
-    highlightRecentGifters: h.highlightRecentGifters,
-    recentGifterMinDiamonds: String(h.recentGifterMinDiamonds),
-    recentGifterWindowSeconds: String(h.recentGifterWindowSeconds),
-  };
-}
-
-function splitSettingLines(text: string): string[] {
-  return text
-    .split('\n')
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-function buildStreamConfigUpdate(input: {
-  catalogGifts: GiftCatalogItem[];
-  enabledGiftKeys: Set<string>;
-  minDiamonds: string;
-  notifyDiamonds: boolean;
-  notifyGifts: boolean;
-  keywordsText: string;
-  highlightUsersText: string;
-  highlightRecentGifters: boolean;
-  recentGifterMinDiamonds: string;
-  recentGifterWindowSeconds: string;
-}): {
-  giftAlertRules: GiftAlertRule[];
-  chatKeywordFlags: string[];
-  chatHighlights: ChatHighlightConfig;
-} {
-  const names = input.catalogGifts
-    .filter((g) => input.enabledGiftKeys.has(g.name.toLowerCase()))
-    .map((g) => g.name);
-  const diamondValue = Number(input.minDiamonds) || 100;
-  return {
-    giftAlertRules: [
-      {
-        minDiamondValue: diamondValue,
-        label: `Gift ≥ ${diamondValue} diamonds`,
-        notify: input.notifyDiamonds,
-      },
-      ...names.map((giftName) => ({
-        giftName,
-        label: giftName,
-        notify: input.notifyGifts,
-      })),
-    ],
-    chatKeywordFlags: splitSettingLines(input.keywordsText),
-    chatHighlights: {
-      highlightUsernames: splitSettingLines(input.highlightUsersText).map(
-        (s) => s.replace(/^@/, ''),
-      ),
-      highlightRecentGifters: input.highlightRecentGifters,
-      recentGifterMinDiamonds: Number(input.recentGifterMinDiamonds) || 1,
-      recentGifterWindowSeconds: Number(input.recentGifterWindowSeconds) || 120,
-    },
-  };
-}
-
-function GiftPickerItem(
-  props: Readonly<{
-    gift: GiftCatalogItem;
-    checked: boolean;
-    onToggle: (key: string) => void;
-  }>,
-) {
-  const key = props.gift.name.toLowerCase();
-  return (
-    <label className="check-field gift-picker-item">
-      <input
-        type="checkbox"
-        checked={props.checked}
-        onChange={() => props.onToggle(key)}
-      />
-      <span>{props.gift.name}</span>
-      {props.gift.diamondValue != null ? (
-        <span className="muted">{props.gift.diamondValue}◆</span>
-      ) : null}
-    </label>
-  );
-}
-
-function GiftPicker(
-  props: Readonly<{
-    catalogGifts: GiftCatalogItem[];
-    catalogQuery: string;
-    enabledGiftKeys: Set<string>;
-    onQueryChange: (value: string) => void;
-    onToggleKey: (key: string) => void;
-  }>,
-) {
-  const query = props.catalogQuery.trim().toLowerCase();
-  const selectedGifts = props.catalogGifts.filter((g) =>
-    props.enabledGiftKeys.has(g.name.toLowerCase()),
-  );
-  const searchHits =
-    query.length === 0
-      ? []
-      : props.catalogGifts
-          .filter((g) => g.name.toLowerCase().includes(query))
-          .filter((g) => !props.enabledGiftKeys.has(g.name.toLowerCase()))
-          .slice(0, 40);
-
-  if (props.catalogGifts.length === 0) {
-    return <p className="muted">Gift catalog unavailable.</p>;
-  }
-
-  return (
-    <>
-      <input
-        type="search"
-        value={props.catalogQuery}
-        onChange={(e) => props.onQueryChange(e.target.value)}
-        placeholder="Search live gifts to add"
-      />
-      {selectedGifts.length > 0 ? (
-        <div className="gift-picker">
-          {selectedGifts.map((gift) => (
-            <GiftPickerItem
-              key={gift.name.toLowerCase()}
-              gift={gift}
-              checked
-              onToggle={props.onToggleKey}
-            />
-          ))}
-        </div>
-      ) : (
-        <p className="muted">No important gifts selected yet.</p>
-      )}
-      {query.length > 0 ? (
-        <div className="gift-picker gift-picker-search">
-          {searchHits.length === 0 ? (
-            <p className="muted">No matching gifts.</p>
-          ) : (
-            searchHits.map((gift) => (
-              <GiftPickerItem
-                key={gift.name.toLowerCase()}
-                gift={gift}
-                checked={false}
-                onToggle={props.onToggleKey}
-              />
-            ))
-          )}
-        </div>
-      ) : (
-        <p className="muted">
-          Search to add from {props.catalogGifts.length} live gifts.
-        </p>
-      )}
-    </>
-  );
-}
-
-function StreamSettingsForm(
-  props: Readonly<{
-    busy: boolean;
-    streamId: string;
-    withBusy: (fn: () => Promise<void>) => Promise<void>;
-    onSaved: () => void;
-    keywordsText: string;
-    minDiamonds: string;
-    notifyDiamonds: boolean;
-    catalogGifts: GiftCatalogItem[];
-    catalogQuery: string;
-    enabledGiftKeys: Set<string>;
-    notifyGifts: boolean;
-    highlightUsersText: string;
-    highlightRecentGifters: boolean;
-    recentGifterMinDiamonds: string;
-    recentGifterWindowSeconds: string;
-    setKeywordsText: (v: string) => void;
-    setMinDiamonds: (v: string) => void;
-    setNotifyDiamonds: (v: boolean) => void;
-    setCatalogQuery: (v: string) => void;
-    setEnabledGiftKeys: (updater: (prev: Set<string>) => Set<string>) => void;
-    setNotifyGifts: (v: boolean) => void;
-    setHighlightUsersText: (v: string) => void;
-    setHighlightRecentGifters: (v: boolean) => void;
-    setRecentGifterMinDiamonds: (v: string) => void;
-    setRecentGifterWindowSeconds: (v: string) => void;
-  }>,
-) {
-  function toggleGiftKey(key: string) {
-    props.setEnabledGiftKeys((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  }
-
-  return (
-    <>
-      <div className="settings-block">
-        <SwitchField
-          label="Diamond threshold alerts"
-          checked={props.notifyDiamonds}
-          onChange={props.setNotifyDiamonds}
-        />
-        {props.notifyDiamonds ? (
-          <label className="field nested">
-            <span>Min diamonds spent</span>
-            <input
-              type="number"
-              min={1}
-              value={props.minDiamonds}
-              onChange={(e) => props.setMinDiamonds(e.target.value)}
-            />
-          </label>
-        ) : null}
-      </div>
-      <div className="settings-block">
-        <SwitchField
-          label="Gift type alerts"
-          checked={props.notifyGifts}
-          onChange={props.setNotifyGifts}
-        />
-        {props.notifyGifts ? (
-          <div className="field nested">
-            <span>Important gifts</span>
-            <GiftPicker
-              catalogGifts={props.catalogGifts}
-              catalogQuery={props.catalogQuery}
-              enabledGiftKeys={props.enabledGiftKeys}
-              onQueryChange={props.setCatalogQuery}
-              onToggleKey={toggleGiftKey}
-            />
-          </div>
-        ) : null}
-      </div>
-      <label className="field">
-        <span>Flagged chat keywords (one per line)</span>
-        <textarea
-          rows={3}
-          value={props.keywordsText}
-          onChange={(e) => props.setKeywordsText(e.target.value)}
-          placeholder={'spam\nscam'}
-        />
-      </label>
-      <label className="field">
-        <span>Always highlight usernames (one per line)</span>
-        <textarea
-          rows={3}
-          value={props.highlightUsersText}
-          onChange={(e) => props.setHighlightUsersText(e.target.value)}
-          placeholder={'vip_user\ncohost'}
-        />
-      </label>
-      <label className="check-field">
-        <input
-          type="checkbox"
-          checked={props.highlightRecentGifters}
-          onChange={(e) => props.setHighlightRecentGifters(e.target.checked)}
-        />
-        <span>Highlight chat from recent gifters</span>
-      </label>
-      <div className="row">
-        <label className="field grow">
-          <span>Gifter min diamonds spent</span>
-          <input
-            type="number"
-            min={1}
-            value={props.recentGifterMinDiamonds}
-            onChange={(e) => props.setRecentGifterMinDiamonds(e.target.value)}
-          />
-        </label>
-        <label className="field grow">
-          <span>Window (seconds)</span>
-          <input
-            type="number"
-            min={10}
-            value={props.recentGifterWindowSeconds}
-            onChange={(e) =>
-              props.setRecentGifterWindowSeconds(e.target.value)
-            }
-          />
-        </label>
-      </div>
-      <button
-        type="button"
-        className="primary"
-        disabled={props.busy}
-        onClick={() =>
-          void props.withBusy(async () => {
-            await putConfig(
-              props.streamId,
-              buildStreamConfigUpdate({
-                catalogGifts: props.catalogGifts,
-                enabledGiftKeys: props.enabledGiftKeys,
-                minDiamonds: props.minDiamonds,
-                notifyDiamonds: props.notifyDiamonds,
-                notifyGifts: props.notifyGifts,
-                keywordsText: props.keywordsText,
-                highlightUsersText: props.highlightUsersText,
-                highlightRecentGifters: props.highlightRecentGifters,
-                recentGifterMinDiamonds: props.recentGifterMinDiamonds,
-                recentGifterWindowSeconds: props.recentGifterWindowSeconds,
-              }),
-            );
-            props.onSaved();
-          })
-        }>
-        Save stream settings
-      </button>
-    </>
-  );
-}
-
-function StreamSettingsEditor(
-  props: Readonly<{
-    streamId: string;
-    busy: boolean;
-    withBusy: (fn: () => Promise<void>) => Promise<void>;
-    onUnauthorized: () => void;
-    onSaved: () => void;
-  }>,
-) {
-  const { streamId, onUnauthorized } = props;
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [keywordsText, setKeywordsText] = useState('');
-  const [minDiamonds, setMinDiamonds] = useState('100');
-  const [notifyDiamonds, setNotifyDiamonds] = useState(true);
-  const [catalogGifts, setCatalogGifts] = useState<GiftCatalogItem[]>([]);
-  const [catalogQuery, setCatalogQuery] = useState('');
-  const [enabledGiftKeys, setEnabledGiftKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [notifyGifts, setNotifyGifts] = useState(true);
-  const [highlightUsersText, setHighlightUsersText] = useState('');
-  const [highlightRecentGifters, setHighlightRecentGifters] = useState(true);
-  const [recentGifterMinDiamonds, setRecentGifterMinDiamonds] = useState('1');
-  const [recentGifterWindowSeconds, setRecentGifterWindowSeconds] =
-    useState('120');
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setLoadError(null);
-    void fetchStreamSettingsValues(streamId).then(
-      (values) => {
-        if (cancelled) return;
-        setKeywordsText(values.keywordsText);
-        setMinDiamonds(values.minDiamonds);
-        setNotifyDiamonds(values.notifyDiamonds);
-        setCatalogGifts(values.catalogGifts);
-        setEnabledGiftKeys(new Set(values.enabledGiftKeys));
-        setNotifyGifts(values.notifyGifts);
-        setHighlightUsersText(values.highlightUsersText);
-        setHighlightRecentGifters(values.highlightRecentGifters);
-        setRecentGifterMinDiamonds(values.recentGifterMinDiamonds);
-        setRecentGifterWindowSeconds(values.recentGifterWindowSeconds);
-      },
-      (err: unknown) => {
-        if (cancelled) return;
-        if (isUnauthorized(err)) {
-          onUnauthorized();
-          return;
-        }
-        setLoadError(err instanceof Error ? err.message : String(err));
-      },
-    ).finally(() => {
-      if (!cancelled) setLoading(false);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [streamId, onUnauthorized]);
-
-  const ready = !loading && !loadError;
-
-  return (
-    <div className="stream-settings">
-      <h3 className="settings-section">Alerts &amp; highlights</h3>
-      {loading ? <p className="muted">Loading settings…</p> : null}
-      {loadError ? <p className="banner error">{loadError}</p> : null}
-      {ready ? (
-        <StreamSettingsForm
-          busy={props.busy}
-          streamId={props.streamId}
-          withBusy={props.withBusy}
-          onSaved={props.onSaved}
-          keywordsText={keywordsText}
-          minDiamonds={minDiamonds}
-          notifyDiamonds={notifyDiamonds}
-          catalogGifts={catalogGifts}
-          catalogQuery={catalogQuery}
-          enabledGiftKeys={enabledGiftKeys}
-          notifyGifts={notifyGifts}
-          highlightUsersText={highlightUsersText}
-          highlightRecentGifters={highlightRecentGifters}
-          recentGifterMinDiamonds={recentGifterMinDiamonds}
-          recentGifterWindowSeconds={recentGifterWindowSeconds}
-          setKeywordsText={setKeywordsText}
-          setMinDiamonds={setMinDiamonds}
-          setNotifyDiamonds={setNotifyDiamonds}
-          setCatalogQuery={setCatalogQuery}
-          setEnabledGiftKeys={setEnabledGiftKeys}
-          setNotifyGifts={setNotifyGifts}
-          setHighlightUsersText={setHighlightUsersText}
-          setHighlightRecentGifters={setHighlightRecentGifters}
-          setRecentGifterMinDiamonds={setRecentGifterMinDiamonds}
-          setRecentGifterWindowSeconds={setRecentGifterWindowSeconds}
-        />
-      ) : null}
     </div>
   );
 }
@@ -1917,8 +1440,8 @@ function SettingsPanel(
     <section className="panel">
       <h1>Settings</h1>
       <p className="muted note">
-        Per-stream alerts and chat highlights are on each stream card under
-        Streams.
+        Alert defaults and name display are under Streams (Global defaults at
+        the top; each stream can override).
       </p>
       {props.passcodeRequired ? (
         <div className="field">

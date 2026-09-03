@@ -2,6 +2,7 @@ import type {
   ChatHighlightConfig,
   ConnectionStatus,
   GiftCatalogItem,
+  GlobalSettings,
   LiveFeed,
   StreamConfig,
 } from '@tiktok-mod/shared';
@@ -12,6 +13,8 @@ export type PublicConfig = {
 };
 
 const PASSCODE_KEY = 'mod_passcode';
+const CLIENT_ID_KEY = 'mod_client_id';
+const LEFT_STREAMS_KEY = 'mod_left_streams';
 
 export function getPasscode(): string {
   return localStorage.getItem(PASSCODE_KEY) ?? '';
@@ -35,6 +38,7 @@ export function authHeaders(): HeadersInit {
   const passcode = getPasscode();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'X-Mod-Client-Id': getClientId(),
   };
   if (passcode) {
     headers.Authorization = `Bearer ${passcode}`;
@@ -70,7 +74,13 @@ export function fetchPublicConfig(): Promise<PublicConfig> {
 }
 
 export function listStreams(): Promise<{
-  streams: Array<{ streamId: string; addedAt: number; isCheckedIn: boolean }>;
+  streams: Array<{
+    streamId: string;
+    addedAt: number;
+    isCheckedIn: boolean;
+    watcherCount: number;
+    youAreWatching: boolean;
+  }>;
 }> {
   return api('/api/streams');
 }
@@ -89,15 +99,67 @@ export function removeStream(streamId: string): Promise<unknown> {
 }
 
 export function checkIn(streamId: string): Promise<unknown> {
+  markStreamJoined(streamId);
   return api(`/api/streams/${encodeURIComponent(streamId)}/check-in`, {
     method: 'POST',
+    body: JSON.stringify({ clientId: getClientId() }),
   });
 }
 
-export function checkOut(streamId: string): Promise<unknown> {
+export function checkOut(
+  streamId: string,
+  opts?: { force?: boolean },
+): Promise<unknown> {
+  markStreamLeft(streamId);
   return api(`/api/streams/${encodeURIComponent(streamId)}/check-out`, {
     method: 'POST',
+    body: JSON.stringify({
+      clientId: getClientId(),
+      force: opts?.force === true,
+    }),
   });
+}
+
+export function pingPresence(streamIds: string[]): Promise<unknown> {
+  const left = getLeftStreams();
+  const wanted = streamIds.filter((id) => id && !left.has(id));
+  return api('/api/presence', {
+    method: 'POST',
+    body: JSON.stringify({ clientId: getClientId(), streamIds: wanted }),
+  });
+}
+
+export function getClientId(): string {
+  let id = localStorage.getItem(CLIENT_ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(CLIENT_ID_KEY, id);
+  }
+  return id;
+}
+
+function getLeftStreams(): Set<string> {
+  try {
+    const raw = localStorage.getItem(LEFT_STREAMS_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((id): id is string => typeof id === 'string'));
+  } catch {
+    return new Set();
+  }
+}
+
+function markStreamLeft(streamId: string): void {
+  const next = getLeftStreams();
+  next.add(streamId);
+  localStorage.setItem(LEFT_STREAMS_KEY, JSON.stringify([...next]));
+}
+
+function markStreamJoined(streamId: string): void {
+  const next = getLeftStreams();
+  next.delete(streamId);
+  localStorage.setItem(LEFT_STREAMS_KEY, JSON.stringify([...next]));
 }
 
 export function getLiveFeed(streamId: string): Promise<LiveFeed> {
@@ -168,12 +230,26 @@ export function getConfig(streamId: string): Promise<StreamConfig> {
 export function putConfig(
   streamId: string,
   body: {
-    giftAlertRules?: StreamConfig['giftAlertRules'];
-    chatKeywordFlags?: string[];
-    chatHighlights?: ChatHighlightConfig;
+    giftAlertRules?: StreamConfig['giftAlertRules'] | null;
+    chatKeywordFlags?: string[] | null;
+    chatHighlights?: ChatHighlightConfig | Partial<ChatHighlightConfig> | null;
+    clearOverrides?: boolean;
   },
 ): Promise<StreamConfig> {
   return api(`/api/streams/${encodeURIComponent(streamId)}/config`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+export function getGlobalSettings(): Promise<GlobalSettings> {
+  return api('/api/global-settings');
+}
+
+export function putGlobalSettings(
+  body: Partial<GlobalSettings>,
+): Promise<GlobalSettings> {
+  return api('/api/global-settings', {
     method: 'PUT',
     body: JSON.stringify(body),
   });
