@@ -6,6 +6,19 @@ declare let self: ServiceWorkerGlobalScope;
 cleanupOutdatedCaches();
 precacheAndRoute(self.__WB_MANIFEST);
 
+// registerType is 'autoUpdate', but the injectManifest strategy does not add
+// these for us. Without them a new worker installs and waits forever, so an
+// installed PWA that is never fully closed keeps serving the bundle it first
+// cached — which is how a client kept polling the pre-cursor live feed across
+// two deploys.
+self.addEventListener('install', () => {
+  void self.skipWaiting();
+});
+
+self.addEventListener('activate', (event: ExtendableEvent) => {
+  event.waitUntil(self.clients.claim());
+});
+
 interface PushPayload {
   title: string;
   body: string;

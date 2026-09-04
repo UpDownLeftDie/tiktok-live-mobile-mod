@@ -54,6 +54,31 @@ const TRIM_EVERY = 25;
 const AUTO_CHECKOUT_AFTER_STREAM_END_MS = 15 * 60_000;
 const AUTO_CHECKOUT_CLIENT_ID = 'auto-checkout';
 
+/** How long a snapshot may be carried forward by merging before a clean read. */
+const SNAPSHOT_REBUILD_MS = 60_000;
+
+interface FeedSlice {
+  seq: number;
+  builtAt: number;
+  chat: ChatLogItem[];
+  events: RoomLogItem[];
+  gifts: GiftLogItem[];
+}
+
+/** Newest first, replacing any entry the delta carries a newer version of. */
+function mergeItems<T extends { id: string; createdAt: number }>(
+  prev: T[],
+  incoming: T[],
+  limit: number,
+): T[] {
+  if (incoming.length === 0) return prev;
+  const byId = new Map(prev.map((item) => [item.id, item]));
+  for (const item of incoming) byId.set(item.id, item);
+  return [...byId.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, limit);
+}
+
 type ChatRow = {
   id: string;
   stream_id: string;
@@ -121,6 +146,7 @@ export class StreamSession implements DurableObject {
     status: ConnectionStatus;
     detail: string | null;
   } | null = null;
+  private feedCache: FeedSlice | null = null;
   private readonly insertsSinceTrim = new Map<FeedTable, number>();
   private globalSettingsCache: { value: GlobalSettings; fetchedAt: number } | null =
     null;
@@ -1026,10 +1052,72 @@ export class StreamSession implements DurableObject {
     // back to a snapshot rather than silently starving it of rows.
     const from = since != null && since <= cursor ? since : null;
 
+    const { chat, events, gifts, seq } =
+      from == null
+        ? this.fullSnapshot(streamId, cursor)
+        : { ...this.readFeed(streamId, from), seq: cursor };
+
+    const feed: LiveFeed = {
+      streamId,
+      status: (cfg.connection_status || 'idle') as ConnectionStatus,
+      statusDetail: cfg.connection_detail,
+      isCheckedIn: config.isCheckedIn,
+      chatHighlights: config.chatHighlights,
+      nameDisplayMode:
+        config.global?.nameDisplayMode ??
+        DEFAULT_GLOBAL_SETTINGS.nameDisplayMode,
+      enabledGiftNames: enabledGiftNamesFromRules(config.giftAlertRules),
+      chat,
+      events,
+      gifts,
+      cursor: seq,
+      incremental: from != null,
+    };
+    return Response.json(feed);
+  }
+
+  /**
+   * A client that asks for a full snapshot every poll — an old bundle, or one
+   * that lost its cursor — used to rescan all three logs each time, which cost
+   * ~680 rows a poll and scaled with the number of viewers. Keep the last
+   * snapshot and fold in only what changed, so the repeat case costs about what
+   * an incremental poll does. The returned seq is the snapshot's, not the log's,
+   * so the client's next `since` picks up exactly where this left off.
+   */
+  private fullSnapshot(streamId: string, cursor: number): FeedSlice {
+    const cache = this.feedCache;
+    if (cache) {
+      if (cache.seq === cursor) return cache;
+      if (Date.now() - cache.builtAt < SNAPSHOT_REBUILD_MS) {
+        const delta = this.readFeed(streamId, cache.seq);
+        const merged = {
+          seq: cursor,
+          builtAt: cache.builtAt,
+          chat: mergeItems(cache.chat, delta.chat, CHAT_LIMIT),
+          events: mergeItems(cache.events, delta.events, EVENT_LIMIT),
+          gifts: mergeItems(cache.gifts, delta.gifts, GIFT_LIMIT),
+        };
+        this.feedCache = merged;
+        return merged;
+      }
+    }
+    const fresh = {
+      ...this.readFeed(streamId, null),
+      seq: cursor,
+      builtAt: Date.now(),
+    };
+    this.feedCache = fresh;
+    return fresh;
+  }
+
+  private readFeed(
+    streamId: string,
+    since: number | null,
+  ): { chat: ChatLogItem[]; events: RoomLogItem[]; gifts: GiftLogItem[] } {
     const chatRows = this.readFeedRows<ChatRow>(
       'chat_log',
       streamId,
-      from,
+      since,
       CHAT_LIMIT,
     );
 
@@ -1054,7 +1142,7 @@ export class StreamSession implements DurableObject {
     const events: RoomLogItem[] = this.readFeedRows<RoomRow>(
       'room_events',
       streamId,
-      from,
+      since,
       EVENT_LIMIT,
     ).map((r) => ({
       id: r.id,
@@ -1069,41 +1157,25 @@ export class StreamSession implements DurableObject {
     const gifts: GiftLogItem[] = this.readFeedRows<GiftRow>(
       'gift_log',
       streamId,
-      from,
+      since,
       GIFT_LIMIT,
     ).map((r) => ({
-        id: r.id,
-        streamId: r.stream_id,
-        senderUsername: r.sender_username,
-        senderNickname: r.sender_nickname ?? null,
-        giftName: r.gift_name,
-        giftCount: r.gift_count,
-        diamondValue: r.diamond_value,
-        targetUsername: r.target_username,
-        targetNickname: r.target_nickname ?? null,
-        alertStatus: (r.alert_status || 'none') as GiftLogItem['alertStatus'],
-        queueItemId: r.queue_item_id,
-        matchedRule: r.matched_rule,
-        createdAt: r.created_at,
-      }));
+      id: r.id,
+      streamId: r.stream_id,
+      senderUsername: r.sender_username,
+      senderNickname: r.sender_nickname ?? null,
+      giftName: r.gift_name,
+      giftCount: r.gift_count,
+      diamondValue: r.diamond_value,
+      targetUsername: r.target_username,
+      targetNickname: r.target_nickname ?? null,
+      alertStatus: (r.alert_status || 'none') as GiftLogItem['alertStatus'],
+      queueItemId: r.queue_item_id,
+      matchedRule: r.matched_rule,
+      createdAt: r.created_at,
+    }));
 
-    const feed: LiveFeed = {
-      streamId,
-      status: (cfg.connection_status || 'idle') as ConnectionStatus,
-      statusDetail: cfg.connection_detail,
-      isCheckedIn: config.isCheckedIn,
-      chatHighlights: config.chatHighlights,
-      nameDisplayMode:
-        config.global?.nameDisplayMode ??
-        DEFAULT_GLOBAL_SETTINGS.nameDisplayMode,
-      enabledGiftNames: enabledGiftNamesFromRules(config.giftAlertRules),
-      chat,
-      events,
-      gifts,
-      cursor,
-      incremental: from != null,
-    };
-    return Response.json(feed);
+    return { chat, events, gifts };
   }
 
   /**
