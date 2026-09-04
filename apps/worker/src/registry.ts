@@ -22,6 +22,8 @@ import { sendWebPush, type StoredSubscription } from './push';
 
 /** Ephemeral watchers expire if the PWA stops heartbeating. Sticky check-ins do not. */
 const PRESENCE_TTL_MS = 20_000;
+const IDLE_CHECKOUT_MS = 60 * 60_000;
+const SUBSCRIPTION_CACHE_MS = 60_000;
 const MIGRATED_CLIENT_ID = 'migrated';
 
 /**
@@ -32,6 +34,7 @@ export class Registry implements DurableObject {
   private readonly env: Env;
   private readonly tracked: TrackedSql;
   private migrated = false;
+  private subscriptionCache: { hasAny: boolean; at: number } | null = null;
 
   constructor(
     private readonly ctx: DurableObjectState,
@@ -266,6 +269,7 @@ export class Registry implements DurableObject {
   private async listCheckedIn(): Promise<Response> {
     const before = this.activeStreamIdSet();
     this.pruneExpiredWatchers();
+    this.pruneUnreachableCheckIns();
     const after = this.activeStreamIdSet();
     this.ctx.waitUntil(this.syncStreamSessions(before, after));
 
@@ -450,6 +454,39 @@ export class Registry implements DurableObject {
       'DELETE FROM check_in_watchers WHERE sticky = 0 AND last_seen_at < ?',
       Date.now() - PRESENCE_TTL_MS,
     );
+  }
+
+  /**
+   * With no push subscription to alert and no browser open anywhere, a check-in
+   * cannot reach anyone — the relay would just burn rows into a feed nobody
+   * reads. Presence on any one stream counts, since watching a single feed
+   * still means the app is open.
+   */
+  private pruneUnreachableCheckIns(): void {
+    if (this.hasPushSubscriptions()) return;
+    const seen = this.tracked
+      .exec<{ t: number | null }>(
+        'SELECT MAX(last_seen_at) AS t FROM check_in_watchers',
+      )
+      .one().t;
+    if (seen == null || Date.now() - seen < IDLE_CHECKOUT_MS) return;
+    this.tracked.exec('DELETE FROM check_in_watchers');
+  }
+
+  private hasPushSubscriptions(): boolean {
+    const now = Date.now();
+    if (
+      this.subscriptionCache &&
+      now - this.subscriptionCache.at < SUBSCRIPTION_CACHE_MS
+    ) {
+      return this.subscriptionCache.hasAny;
+    }
+    const hasAny =
+      this.tracked
+        .exec<{ n: number }>('SELECT COUNT(*) AS n FROM push_subscriptions')
+        .one().n > 0;
+    this.subscriptionCache = { hasAny, at: now };
+    return hasAny;
   }
 
   /** First real device to touch a pre-migration check-in inherits the sticky slot. */
@@ -640,6 +677,7 @@ export class Registry implements DurableObject {
       sub.keys.auth,
       Date.now(),
     );
+    this.subscriptionCache = null;
     return Response.json({ ok: true });
   }
 
@@ -734,6 +772,7 @@ export class Registry implements DurableObject {
           'DELETE FROM push_subscriptions WHERE endpoint = ?',
           sub.endpoint,
         );
+        this.subscriptionCache = null;
       }
     }
     return results;

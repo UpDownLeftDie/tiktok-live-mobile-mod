@@ -47,6 +47,13 @@ type FeedTable = (typeof FEED_TABLES)[number];
  */
 const TRIM_EVERY = 25;
 
+/**
+ * Grace period after a broadcast ends before the check-in is released, so a
+ * broadcaster who drops and restarts does not cost the mod their check-in.
+ */
+const AUTO_CHECKOUT_AFTER_STREAM_END_MS = 15 * 60_000;
+const AUTO_CHECKOUT_CLIENT_ID = 'auto-checkout';
+
 type ChatRow = {
   id: string;
   stream_id: string;
@@ -110,6 +117,10 @@ export class StreamSession implements DurableObject {
   private readonly tracked: TrackedSql;
   private migrated = false;
   private seq: number | null = null;
+  private lastStatus: {
+    status: ConnectionStatus;
+    detail: string | null;
+  } | null = null;
   private readonly insertsSinceTrim = new Map<FeedTable, number>();
   private globalSettingsCache: { value: GlobalSettings; fetchedAt: number } | null =
     null;
@@ -451,21 +462,33 @@ export class StreamSession implements DurableObject {
     };
   }
 
+  /**
+   * The relay re-reports `offline` every 30s while waiting for a broadcaster,
+   * so skip writes that would not change anything.
+   */
   private setStatus(
     streamId: string,
     status: ConnectionStatus,
     detail?: string | null,
   ): void {
+    const nextDetail = detail ?? null;
+    if (
+      this.lastStatus?.status === status &&
+      this.lastStatus.detail === nextDetail
+    ) {
+      return;
+    }
     this.ensureConfig(streamId);
     this.tracked.exec(
       `UPDATE stream_config
        SET connection_status = ?, connection_detail = ?, status_updated_at = ?
        WHERE stream_id = ?`,
       status,
-      detail ?? null,
+      nextDetail,
       Date.now(),
       streamId,
     );
+    this.lastStatus = { status, detail: nextDetail };
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -652,6 +675,9 @@ export class StreamSession implements DurableObject {
       isCheckedIn ? 1 : 0,
       streamId,
     );
+    if (isCheckedIn) {
+      this.ctx.waitUntil(this.ctx.storage.deleteAlarm());
+    }
     if (was && !isCheckedIn) {
       this.setStatus(streamId, 'idle', 'checked_out');
     } else if (!was && isCheckedIn) {
@@ -688,12 +714,22 @@ export class StreamSession implements DurableObject {
     }
   }
 
-  private handleStatus(streamId: string, event: RelayStatusEvent): Response {
+  private async handleStatus(
+    streamId: string,
+    event: RelayStatusEvent,
+  ): Promise<Response> {
     this.setStatus(streamId, event.status, event.detail ?? null);
+    // Broadcaster came back inside the grace period.
+    if (event.status === 'live') {
+      await this.ctx.storage.deleteAlarm();
+    }
     return Response.json({ ok: true });
   }
 
-  private handleRoom(streamId: string, event: RelayRoomEvent): Response {
+  private async handleRoom(
+    streamId: string,
+    event: RelayRoomEvent,
+  ): Promise<Response> {
     this.tracked.exec(
       `INSERT INTO room_events (id, stream_id, type, username, nickname, summary, created_at, seq)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -707,7 +743,58 @@ export class StreamSession implements DurableObject {
       this.nextSeq(),
     );
     this.trimTable('room_events', streamId, EVENT_LIMIT);
+    if (event.type === 'stream_end') {
+      await this.ctx.storage.setAlarm(
+        Date.now() + AUTO_CHECKOUT_AFTER_STREAM_END_MS,
+      );
+    }
     return Response.json({ ok: true });
+  }
+
+  /**
+   * Fires once the post-broadcast grace period elapses. Releasing the check-in
+   * stops the relay reconnecting to a stream nobody asked for any more.
+   */
+  async alarm(): Promise<void> {
+    await this.ensureMigrated();
+    try {
+      const row = this.tracked
+        .exec<{
+          stream_id: string;
+          connection_status: string;
+          is_checked_in: number;
+        }>(
+          `SELECT stream_id, connection_status, is_checked_in
+           FROM stream_config LIMIT 1`,
+        )
+        .toArray()[0];
+      if (!row || row.is_checked_in !== 1) return;
+      if (row.connection_status === 'live') return;
+      await this.autoCheckOut(row.stream_id);
+    } catch (err) {
+      console.error('StreamSession alarm error', err);
+    } finally {
+      this.tracked.flush();
+    }
+  }
+
+  private async autoCheckOut(streamId: string): Promise<void> {
+    const result = await this.env.REGISTRY.get(
+      this.env.REGISTRY.idFromName('global'),
+    ).fetch(
+      new Request('https://registry/check-out', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          streamId,
+          clientId: AUTO_CHECKOUT_CLIENT_ID,
+          force: true,
+        }),
+      }),
+    );
+    if (!result.ok) return;
+    const payload = (await result.json()) as { isCheckedIn?: boolean };
+    this.applyCheckedIn(streamId, Boolean(payload.isCheckedIn));
   }
 
   private async handleGift(
