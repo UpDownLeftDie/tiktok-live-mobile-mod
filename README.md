@@ -57,12 +57,8 @@ In the PWA: add a TikTok username → Settings → enable push → Check in. Gif
 
 ## Deploy Worker (Cloudflare)
 
-The account id is not committed, so put it in `apps/worker/.env` (gitignored)
-before deploying — otherwise wrangler cannot pick an account non-interactively:
-
-```bash
-echo "CLOUDFLARE_ACCOUNT_ID=<your account id>" > apps/worker/.env
-```
+The account id is not committed. Wrangler prompts you to pick an account; if you
+deploy from a script or CI, export `CLOUDFLARE_ACCOUNT_ID` instead.
 
 ```bash
 cd apps/worker
@@ -76,9 +72,16 @@ npx wrangler secret put VAPID_PUBLIC_KEY      # or [vars] in wrangler.toml
 pnpm deploy
 ```
 
-Optional: set `CF_ACCOUNT_ID` and `CF_API_TOKEN` (Account Analytics:Read) as
-secrets to have the Settings quota panel report billing-accurate KV and Durable
-Objects usage instead of counters the Durable Objects track themselves.
+Optional, for the Settings quota panel:
+
+```bash
+npx wrangler secret put CF_ACCOUNT_ID
+npx wrangler secret put CF_API_TOKEN          # token with Account Analytics:Read
+```
+
+With both set, the panel reports billing-accurate KV and Durable Objects usage.
+Without them it falls back to counters the Durable Objects track themselves,
+which only cover this Worker. For local dev, put the same pair in `.dev.vars`.
 
 Note the Worker URL (e.g. `https://tiktok-live-mod.<account>.workers.dev`).
 

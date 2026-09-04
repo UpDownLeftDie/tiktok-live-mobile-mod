@@ -2,9 +2,8 @@ name = "tiktok-live-mod"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 compatibility_flags = []
-# account_id is deliberately not committed. Set CLOUDFLARE_ACCOUNT_ID in
-# apps/worker/.env (gitignored), or wrangler cannot pick an account
-# non-interactively.
+# account_id is deliberately not committed. Wrangler prompts for an account
+# interactively; set CLOUDFLARE_ACCOUNT_ID when deploying from a script or CI.
 
 [assets]
 directory = "./client/dist"
