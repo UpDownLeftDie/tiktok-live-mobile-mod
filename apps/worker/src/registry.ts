@@ -17,6 +17,7 @@ import {
 } from '@tiktok-mod/shared';
 import { parseClientId } from './auth';
 import type { Env } from './env';
+import { TrackedSql } from './quota';
 import { sendWebPush, type StoredSubscription } from './push';
 
 /** Ephemeral watchers expire if the PWA stops heartbeating. Sticky check-ins do not. */
@@ -29,6 +30,7 @@ const MIGRATED_CLIENT_ID = 'migrated';
  */
 export class Registry implements DurableObject {
   private readonly env: Env;
+  private readonly tracked: TrackedSql;
   private migrated = false;
 
   constructor(
@@ -36,6 +38,7 @@ export class Registry implements DurableObject {
     env: Env,
   ) {
     this.env = env;
+    this.tracked = new TrackedSql(ctx);
   }
 
   private async ensureMigrated(): Promise<void> {
@@ -47,7 +50,7 @@ export class Registry implements DurableObject {
   }
 
   private migrate(): void {
-    this.ctx.storage.sql.exec(`
+    this.tracked.exec(`
       CREATE TABLE IF NOT EXISTS checked_in (
         stream_id TEXT PRIMARY KEY,
         checked_in_at INTEGER NOT NULL
@@ -88,7 +91,7 @@ export class Registry implements DurableObject {
 
   /** Existing stream-level check-ins become a sticky placeholder until a real device claims them. */
   private migrateCheckedInToWatchers(): void {
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT OR IGNORE INTO check_in_watchers (stream_id, client_id, sticky, last_seen_at)
        SELECT stream_id, ?, 1, checked_in_at FROM checked_in`,
       MIGRATED_CLIENT_ID,
@@ -96,11 +99,11 @@ export class Registry implements DurableObject {
   }
 
   private ensureGlobalSettingsRow(): void {
-    const existing = this.ctx.storage.sql
+    const existing = this.tracked
       .exec<{ id: number }>('SELECT id FROM global_settings WHERE id = 1')
       .toArray();
     if (existing.length > 0) return;
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO global_settings (
          id, gift_alert_rules, chat_keyword_flags, chat_highlights, name_display_mode
        ) VALUES (1, ?, ?, ?, ?)`,
@@ -113,12 +116,17 @@ export class Registry implements DurableObject {
 
   async fetch(request: Request): Promise<Response> {
     await this.ensureMigrated();
-    const path = new URL(request.url).pathname;
-    const routeKey = `${request.method} ${path}`;
+    try {
+      const path = new URL(request.url).pathname;
+      const routeKey = `${request.method} ${path}`;
 
-    switch (routeKey) {
-      case 'GET /list':
-        return this.listCheckedIn();
+      switch (routeKey) {
+        case 'GET /quota':
+          return Response.json(this.tracked.snapshot());
+        case 'GET /stream-ids':
+          return this.listStreamIds();
+        case 'GET /list':
+          return this.listCheckedIn();
       case 'POST /check-in':
         return this.checkIn(request);
       case 'POST /check-out':
@@ -153,11 +161,16 @@ export class Registry implements DurableObject {
       return this.removeStream(path);
     }
     return Response.json({ error: 'not found' }, { status: 404 });
+    } finally {
+      this.ctx.waitUntil(
+        Promise.resolve().then(() => this.tracked.flush()),
+      );
+    }
   }
 
   private getGlobalSettings(): GlobalSettings {
     this.ensureGlobalSettingsRow();
-    const row = this.ctx.storage.sql
+    const row = this.tracked
       .exec<{
         gift_alert_rules: string;
         chat_keyword_flags: string;
@@ -225,7 +238,7 @@ export class Registry implements DurableObject {
         ? parseNameDisplayMode(body.nameDisplayMode)
         : current.nameDisplayMode;
 
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `UPDATE global_settings SET
          gift_alert_rules = ?,
          chat_keyword_flags = ?,
@@ -239,6 +252,15 @@ export class Registry implements DurableObject {
     );
 
     return Response.json(this.getGlobalSettings());
+  }
+
+  private listStreamIds(): Response {
+    const rows = this.tracked
+      .exec<{ stream_id: string }>('SELECT stream_id FROM streams')
+      .toArray();
+    return Response.json({
+      streamIds: rows.map((r) => r.stream_id),
+    });
   }
 
   private async listCheckedIn(): Promise<Response> {
@@ -269,7 +291,7 @@ export class Registry implements DurableObject {
       return Response.json({ error: 'clientId required' }, { status: 400 });
     }
     this.upsertWatcher(body.streamId, clientId, true);
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO streams (stream_id, added_at) VALUES (?, ?)
        ON CONFLICT(stream_id) DO NOTHING`,
       body.streamId,
@@ -293,12 +315,12 @@ export class Registry implements DurableObject {
       return Response.json({ error: 'clientId required' }, { status: 400 });
     }
     if (body.force === true) {
-      this.ctx.storage.sql.exec(
+      this.tracked.exec(
         'DELETE FROM check_in_watchers WHERE stream_id = ?',
         body.streamId,
       );
     } else {
-      this.ctx.storage.sql.exec(
+      this.tracked.exec(
         'DELETE FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
         body.streamId,
         clientId,
@@ -326,12 +348,12 @@ export class Registry implements DurableObject {
     this.pruneExpiredWatchers();
 
     if (streamIds.length === 0) {
-      this.ctx.storage.sql.exec(
+      this.tracked.exec(
         'DELETE FROM check_in_watchers WHERE client_id = ? AND sticky = 0',
         clientId,
       );
     } else {
-      this.ctx.storage.sql.exec(
+      this.tracked.exec(
         `DELETE FROM check_in_watchers
          WHERE client_id = ? AND sticky = 0 AND stream_id NOT IN (${streamIds
            .map(() => '?')
@@ -366,7 +388,7 @@ export class Registry implements DurableObject {
     }
 
     const clientId = parseClientId(new URL(request.url).searchParams.get('clientId'));
-    const rows = this.ctx.storage.sql
+    const rows = this.tracked
       .exec<{
         stream_id: string;
         added_at: number;
@@ -393,7 +415,7 @@ export class Registry implements DurableObject {
     if (!streamId) {
       return Response.json({ error: 'streamId required' }, { status: 400 });
     }
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO streams (stream_id, added_at) VALUES (?, ?)
        ON CONFLICT(stream_id) DO NOTHING`,
       streamId,
@@ -405,15 +427,15 @@ export class Registry implements DurableObject {
   private async removeStream(path: string): Promise<Response> {
     const streamId = decodeURIComponent(path.slice('/streams/'.length));
     const wasActive = this.activeStreamIdSet().has(streamId);
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       'DELETE FROM streams WHERE stream_id = ?',
       streamId,
     );
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       'DELETE FROM checked_in WHERE stream_id = ?',
       streamId,
     );
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       'DELETE FROM check_in_watchers WHERE stream_id = ?',
       streamId,
     );
@@ -424,7 +446,7 @@ export class Registry implements DurableObject {
   }
 
   private pruneExpiredWatchers(): void {
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       'DELETE FROM check_in_watchers WHERE sticky = 0 AND last_seen_at < ?',
       Date.now() - PRESENCE_TTL_MS,
     );
@@ -432,7 +454,7 @@ export class Registry implements DurableObject {
 
   /** First real device to touch a pre-migration check-in inherits the sticky slot. */
   private takeMigratedSticky(streamId: string): boolean {
-    const row = this.ctx.storage.sql
+    const row = this.tracked
       .exec<{ n: number }>(
         'SELECT COUNT(*) AS n FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
         streamId,
@@ -440,7 +462,7 @@ export class Registry implements DurableObject {
       )
       .one();
     if (row.n === 0) return false;
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       'DELETE FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
       streamId,
       MIGRATED_CLIENT_ID,
@@ -455,7 +477,7 @@ export class Registry implements DurableObject {
   ): void {
     const inherited = this.takeMigratedSticky(streamId);
     const makeSticky = sticky || inherited ? 1 : 0;
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO check_in_watchers (stream_id, client_id, sticky, last_seen_at)
        VALUES (?, ?, ?, ?)
        ON CONFLICT(stream_id, client_id) DO UPDATE SET
@@ -473,7 +495,7 @@ export class Registry implements DurableObject {
   }
 
   private watcherCount(streamId: string): number {
-    return this.ctx.storage.sql
+    return this.tracked
       .exec<{ n: number }>(
         'SELECT COUNT(*) AS n FROM check_in_watchers WHERE stream_id = ?',
         streamId,
@@ -492,7 +514,7 @@ export class Registry implements DurableObject {
     youAreWatching: boolean;
   } {
     const count = this.watcherCount(streamId);
-    const you = this.ctx.storage.sql
+    const you = this.tracked
       .exec<{ n: number }>(
         'SELECT COUNT(*) AS n FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
         streamId,
@@ -510,7 +532,7 @@ export class Registry implements DurableObject {
 
   private activeStreamIdSet(): Set<string> {
     return new Set(
-      this.ctx.storage.sql
+      this.tracked
         .exec<{ stream_id: string }>(
           'SELECT DISTINCT stream_id FROM check_in_watchers',
         )
@@ -520,7 +542,7 @@ export class Registry implements DurableObject {
   }
 
   private earliestWatcherSeen(streamId: string): number {
-    const row = this.ctx.storage.sql
+    const row = this.tracked
       .exec<{ t: number | null }>(
         'SELECT MIN(last_seen_at) AS t FROM check_in_watchers WHERE stream_id = ?',
         streamId,
@@ -531,7 +553,7 @@ export class Registry implements DurableObject {
 
   private watchersByStream(): Map<string, Set<string>> {
     const map = new Map<string, Set<string>>();
-    const rows = this.ctx.storage.sql
+    const rows = this.tracked
       .exec<{ stream_id: string; client_id: string }>(
         'SELECT stream_id, client_id FROM check_in_watchers',
       )
@@ -550,13 +572,13 @@ export class Registry implements DurableObject {
   private syncCheckedInRow(streamId: string): void {
     const count = this.watcherCount(streamId);
     if (count === 0) {
-      this.ctx.storage.sql.exec(
+      this.tracked.exec(
         'DELETE FROM checked_in WHERE stream_id = ?',
         streamId,
       );
       return;
     }
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO checked_in (stream_id, checked_in_at) VALUES (?, ?)
        ON CONFLICT(stream_id) DO NOTHING`,
       streamId,
@@ -609,7 +631,7 @@ export class Registry implements DurableObject {
     if (!sub.endpoint || !sub.keys?.p256dh || !sub.keys?.auth) {
       return Response.json({ error: 'invalid subscription' }, { status: 400 });
     }
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at)
        VALUES (?, ?, ?, ?)
        ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`,
@@ -640,7 +662,7 @@ export class Registry implements DurableObject {
   }
 
   private getGiftCatalog(): Response {
-    const row = this.ctx.storage.sql
+    const row = this.tracked
       .exec<{ gifts_json: string; updated_at: number }>(
         'SELECT gifts_json, updated_at FROM gift_catalog WHERE id = 1',
       )
@@ -680,7 +702,7 @@ export class Registry implements DurableObject {
     const gifts = dedupeGiftCatalogByName(
       Array.isArray(body.gifts) ? body.gifts : [],
     );
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO gift_catalog (id, gifts_json, updated_at) VALUES (1, ?, ?)
        ON CONFLICT(id) DO UPDATE SET gifts_json = excluded.gifts_json,
          updated_at = excluded.updated_at`,
@@ -691,7 +713,7 @@ export class Registry implements DurableObject {
   }
 
   private listSubscriptions(): StoredSubscription[] {
-    return this.ctx.storage.sql
+    return this.tracked
       .exec<{
         endpoint: string;
         p256dh: string;
@@ -708,7 +730,7 @@ export class Registry implements DurableObject {
       const result = await sendWebPush(this.env, sub, payload);
       results.push({ endpoint: sub.endpoint, status: result.status });
       if (result.status === 404 || result.status === 410) {
-        this.ctx.storage.sql.exec(
+        this.tracked.exec(
           'DELETE FROM push_subscriptions WHERE endpoint = ?',
           sub.endpoint,
         );

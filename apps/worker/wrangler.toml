@@ -2,6 +2,8 @@ name = "tiktok-live-mod"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 compatibility_flags = []
+# account_id is deliberately not committed. Export CLOUDFLARE_ACCOUNT_ID before
+# deploying, or wrangler cannot pick an account non-interactively.
 
 [assets]
 directory = "./client/dist"
@@ -33,3 +35,5 @@ new_sqlite_classes = ["StreamSession", "Registry"]
 #   MOD_PASSCODE
 #   VAPID_PRIVATE_KEY
 #   VAPID_SUBJECT   (e.g. mailto:you@example.com)
+#   CF_ACCOUNT_ID   (optional; pairs with CF_API_TOKEN for the quota panel)
+#   CF_API_TOKEN    (Account Analytics Read — optional; enables KV + billing-accurate DO usage)

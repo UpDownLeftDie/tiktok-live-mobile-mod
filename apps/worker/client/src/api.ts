@@ -162,8 +162,12 @@ function markStreamJoined(streamId: string): void {
   localStorage.setItem(LEFT_STREAMS_KEY, JSON.stringify([...next]));
 }
 
-export function getLiveFeed(streamId: string): Promise<LiveFeed> {
-  return api(`/api/streams/${encodeURIComponent(streamId)}/live`);
+export function getLiveFeed(
+  streamId: string,
+  since?: number | null,
+): Promise<LiveFeed> {
+  const query = since == null ? '' : `?since=${since}`;
+  return api(`/api/streams/${encodeURIComponent(streamId)}/live${query}`);
 }
 
 export function markDone(streamId: string, itemId: string): Promise<unknown> {
@@ -273,6 +277,29 @@ export function subscribePush(
 
 export function testPush(): Promise<unknown> {
   return api('/api/test-push', { method: 'POST' });
+}
+
+export type QuotaMetric = {
+  key: string;
+  label: string;
+  used: number;
+  limit: number;
+};
+
+export type QuotaSnapshot = {
+  source: 'cloudflare' | 'local';
+  date: string;
+  resetAt: string;
+  metrics: QuotaMetric[];
+  objects: Array<{
+    name: string;
+    rowsRead: number;
+    rowsWritten: number;
+  }>;
+};
+
+export function fetchQuota(): Promise<QuotaSnapshot> {
+  return api('/api/quota');
 }
 
 export function urlBase64ToUint8Array(base64String: string): Uint8Array {

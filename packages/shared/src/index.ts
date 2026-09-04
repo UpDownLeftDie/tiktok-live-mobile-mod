@@ -382,6 +382,10 @@ export interface LiveFeed {
   chat: ChatLogItem[];
   events: RoomLogItem[];
   gifts: GiftLogItem[];
+  /** Monotonic position in this stream's log; pass back as `since` to poll. */
+  cursor?: number;
+  /** When true, the log arrays hold only rows added or changed since `since`. */
+  incremental?: boolean;
 }
 
 export interface CheckedInStream {

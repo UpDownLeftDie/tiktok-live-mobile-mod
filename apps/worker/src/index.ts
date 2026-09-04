@@ -1,5 +1,6 @@
 import { requireModAuth, requireRelayAuth, registryStub, streamStub } from "./auth";
 import type { Env } from "./env";
+import { fetchQuotaSnapshot } from "./quota";
 
 export { StreamSession } from "./stream-session";
 export { Registry } from "./registry";
@@ -116,7 +117,9 @@ async function handleQueueAndConfig(
 ): Promise<Response | null> {
   const live = matchStreamPath(pathname, "/live");
   if (live && request.method === "GET") {
-    return denied ?? forwardToStream(env, live, "/live", request);
+    const since = url.searchParams.get("since");
+    const extra = since ? `&since=${encodeURIComponent(since)}` : "";
+    return denied ?? forwardToStream(env, live, "/live", request, extra);
   }
 
   const queue = matchStreamPath(pathname, "/queue");
@@ -256,24 +259,38 @@ async function handlePushRoutes(
   }
 
   if (pathname === "/api/global-settings") {
-    const denied = requireModAuth(request, env);
-    if (denied) return denied;
-    if (request.method === "GET") {
-      return registryStub(env).fetch(
-        new Request("https://registry/global-settings"),
-      );
-    }
-    if (request.method === "PUT") {
-      return registryStub(env).fetch(
-        new Request("https://registry/global-settings", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: await request.text(),
-        }),
-      );
-    }
+    return handleGlobalSettings(request, env);
   }
 
+  if (pathname === "/api/quota" && request.method === "GET") {
+    const denied = requireModAuth(request, env);
+    if (denied) return denied;
+    return json(await fetchQuotaSnapshot(env));
+  }
+
+  return null;
+}
+
+async function handleGlobalSettings(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const denied = requireModAuth(request, env);
+  if (denied) return denied;
+  if (request.method === "GET") {
+    return registryStub(env).fetch(
+      new Request("https://registry/global-settings"),
+    );
+  }
+  if (request.method === "PUT") {
+    return registryStub(env).fetch(
+      new Request("https://registry/global-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: await request.text(),
+      }),
+    );
+  }
   return null;
 }
 

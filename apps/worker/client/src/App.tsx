@@ -17,6 +17,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
   type SubmitEvent,
@@ -27,6 +28,7 @@ import {
   checkOut,
   DEFAULT_CHAT_HIGHLIGHTS,
   fetchPublicConfig,
+  fetchQuota,
   getLiveFeed,
   getPasscode,
   listStreams,
@@ -42,6 +44,7 @@ import {
   subscribePush,
   testPush,
   urlBase64ToUint8Array,
+  type QuotaSnapshot,
 } from './api';
 import { StreamsPanel, type StreamRow } from './StreamSettings';
 
@@ -230,6 +233,48 @@ const EMPTY_FEED: LiveFeed = {
   gifts: [],
 };
 
+const LIVE_POLL_MS = 2500;
+const PRESENCE_POLL_MS = 10_000;
+/** Matches the server-side log caps, so trimmed rows fall off the client too. */
+const FEED_KEEP = 200;
+
+function mergeFeed(prev: LiveFeed, next: LiveFeed): LiveFeed {
+  if (!next.incremental || prev.streamId !== next.streamId) return next;
+  const chat = mergeLog(prev.chat, next.chat);
+  const events = mergeLog(prev.events, next.events);
+  const gifts = mergeLog(prev.gifts, next.gifts);
+  const unchanged =
+    chat === prev.chat &&
+    events === prev.events &&
+    gifts === prev.gifts &&
+    sameFeedMeta(prev, next);
+  return unchanged ? prev : { ...next, chat, events, gifts };
+}
+
+function mergeLog<T extends { id: string; createdAt: number }>(
+  prev: T[],
+  incoming: T[],
+): T[] {
+  if (incoming.length === 0) return prev;
+  const byId = new Map(prev.map((item) => [item.id, item]));
+  for (const item of incoming) byId.set(item.id, item);
+  return [...byId.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, FEED_KEEP);
+}
+
+/** Everything outside the logs, so a quiet poll can keep the previous state. */
+function sameFeedMeta(a: LiveFeed, b: LiveFeed): boolean {
+  return (
+    a.status === b.status &&
+    a.statusDetail === b.statusDetail &&
+    a.isCheckedIn === b.isCheckedIn &&
+    a.nameDisplayMode === b.nameDisplayMode &&
+    a.enabledGiftNames.join('\n') === b.enabledGiftNames.join('\n') &&
+    JSON.stringify(a.chatHighlights) === JSON.stringify(b.chatHighlights)
+  );
+}
+
 export function App() {
   const [boot, setBoot] = useState<BootState>({ phase: 'loading' });
 
@@ -396,6 +441,14 @@ function ModApp(
   const [pushStatus, setPushStatus] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [quota, setQuota] = useState<QuotaSnapshot | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const feedCursor = useRef<number | null>(null);
+  const selectedRef = useRef(selected);
+
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
 
   const selectedStream = useMemo(
     () => streams.find((s) => s.streamId === selected) ?? null,
@@ -405,6 +458,7 @@ function ModApp(
   const handleUnauthorized = useCallback(() => {
     setPasscode('');
     setStreams([]);
+    feedCursor.current = null;
     setFeed(EMPTY_FEED);
     props.onLock();
   }, [props]);
@@ -427,21 +481,29 @@ function ModApp(
     }
   }, [handleUnauthorized]);
 
-  const refreshLive = useCallback(async () => {
-    if (!selected) {
-      setFeed(EMPTY_FEED);
-      return;
-    }
-    try {
-      setFeed(await getLiveFeed(selected));
-    } catch (err) {
-      if (isUnauthorized(err)) {
-        handleUnauthorized();
+  const refreshLive = useCallback(
+    async (full = false) => {
+      if (!selected) {
+        feedCursor.current = null;
+        setFeed(EMPTY_FEED);
         return;
       }
-      throw err;
-    }
-  }, [selected, handleUnauthorized]);
+      if (full) feedCursor.current = null;
+      try {
+        const next = await getLiveFeed(selected, feedCursor.current);
+        if (selectedRef.current !== selected) return;
+        feedCursor.current = next.cursor ?? null;
+        setFeed((prev) => mergeFeed(prev, next));
+      } catch (err) {
+        if (isUnauthorized(err)) {
+          handleUnauthorized();
+          return;
+        }
+        throw err;
+      }
+    },
+    [selected, handleUnauthorized],
+  );
 
   const tick = useCallback(async () => {
     try {
@@ -453,8 +515,7 @@ function ModApp(
       }
     }
     await refreshStreams().catch(() => undefined);
-    await refreshLive().catch(() => undefined);
-  }, [selected, handleUnauthorized, refreshStreams, refreshLive]);
+  }, [selected, handleUnauthorized, refreshStreams]);
 
   useEffect(() => {
     const fromUrl = new URLSearchParams(window.location.search).get('stream');
@@ -467,13 +528,57 @@ function ModApp(
     );
   }, [refreshStreams]);
 
+  // Presence lasts 20s server-side and the stream list barely moves, so this
+  // doesn't need the live feed's cadence.
   useEffect(() => {
-    void tick().catch(() => undefined);
-    const id = window.setInterval(() => {
+    const run = () => {
+      if (document.hidden) return;
       void tick().catch(() => undefined);
-    }, 2500);
+    };
+    run();
+    const id = window.setInterval(run, PRESENCE_POLL_MS);
     return () => window.clearInterval(id);
   }, [tick]);
+
+  // Polling only asks for rows past the cursor, and a hidden tab asks for
+  // nothing at all — alerts still arrive as push notifications.
+  useEffect(() => {
+    const run = (full: boolean) => {
+      if (document.hidden) return;
+      void refreshLive(full).catch(() => undefined);
+    };
+    run(true);
+    const id = window.setInterval(() => run(false), LIVE_POLL_MS);
+    const onVisibility = () => run(true);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [refreshLive]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadQuota() {
+      if (document.hidden) return;
+      try {
+        const data = await fetchQuota();
+        if (!cancelled) setQuota(data);
+      } catch (err) {
+        if (isUnauthorized(err)) {
+          handleUnauthorized();
+        }
+      }
+    }
+    void loadQuota();
+    const poll = window.setInterval(() => void loadQuota(), 60_000);
+    const clock = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(poll);
+      window.clearInterval(clock);
+    };
+  }, [handleUnauthorized]);
 
   async function withBusy(fn: () => Promise<void>) {
     setBusy(true);
@@ -492,28 +597,7 @@ function ModApp(
   }
 
   async function enablePush() {
-    if (!props.vapidPublicKey) {
-      setPushStatus('VAPID public key not configured on the Worker.');
-      return;
-    }
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      setPushStatus('Push not supported in this browser.');
-      return;
-    }
-    const permission = await Notification.requestPermission();
-    if (permission !== 'granted') {
-      setPushStatus(`Permission: ${permission}`);
-      return;
-    }
-    const reg = await navigator.serviceWorker.ready;
-    const sub = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(
-        props.vapidPublicKey,
-      ) as BufferSource,
-    });
-    await subscribePush(sub.toJSON());
-    setPushStatus('Subscribed to push.');
+    setPushStatus(await ensureWebPush(props.vapidPublicKey));
   }
 
   const status: ConnectionStatus = selectedStream?.isCheckedIn
@@ -533,6 +617,7 @@ function ModApp(
       </header>
 
       {error ? <div className="banner error">{error}</div> : null}
+      <QuotaBanner quota={quota} now={now} />
 
       <nav className="tabs">
         {(['live', 'streams', 'settings'] as Tab[]).map((t) => (
@@ -612,6 +697,20 @@ function ModApp(
             }
             onCheckIn={(id) =>
               void withBusy(async () => {
+                // Prompt first while the tap is still a user gesture.
+                const permission =
+                  'Notification' in window ? Notification.permission : 'denied';
+                if (permission === 'default') {
+                  const pushMsg = await ensureWebPush(
+                    props.vapidPublicKey,
+                    true,
+                  ).catch(() => '');
+                  if (pushMsg) setPushStatus(pushMsg);
+                } else if (permission === 'granted') {
+                  void ensureWebPush(props.vapidPublicKey, true).catch(
+                    () => undefined,
+                  );
+                }
                 await checkIn(id);
                 setSelected(id);
                 setTab('live');
@@ -658,6 +757,8 @@ function ModApp(
             passcodeRequired={props.passcodeRequired}
             pushStatus={pushStatus}
             busy={busy}
+            quota={quota}
+            now={now}
             onPasscodeChange={setPasscodeInput}
             onPasscodeBlur={() => setPasscode(passcodeInput)}
             onLock={() => {
@@ -1423,12 +1524,128 @@ function GiftList(
   );
 }
 
+function formatResetIn(resetAt: string, now: number): string {
+  const ms = new Date(resetAt).getTime() - now;
+  if (ms <= 0) return 'soon (midnight UTC)';
+  const totalMin = Math.max(0, Math.floor(ms / 60_000));
+  const hours = Math.floor(totalMin / 60);
+  const minutes = totalMin % 60;
+  if (hours <= 0) return `${minutes}m (midnight UTC)`;
+  return `${hours}h ${minutes}m (midnight UTC)`;
+}
+
+function formatCount(n: number): string {
+  if (n >= 1_000_000) {
+    const value = n / 1_000_000;
+    return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)}M`;
+  }
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return n.toLocaleString();
+}
+
+function metricPercent(used: number, limit: number): number {
+  if (limit <= 0) return 0;
+  return used / limit;
+}
+
+function worstMetric(quota: QuotaSnapshot) {
+  return quota.metrics.reduce<(typeof quota.metrics)[number] | undefined>(
+    (worst, metric) => {
+      if (!worst) return metric;
+      const pct = metricPercent(metric.used, metric.limit);
+      const worstPct = metricPercent(worst.used, worst.limit);
+      return pct > worstPct ? metric : worst;
+    },
+    undefined,
+  );
+}
+
+function QuotaBanner(
+  props: Readonly<{ quota: QuotaSnapshot | null; now: number }>,
+) {
+  if (!props.quota || props.quota.metrics.length === 0) return null;
+  const worst = worstMetric(props.quota);
+  if (!worst) return null;
+  const pct = metricPercent(worst.used, worst.limit);
+  if (pct < 0.5) return null;
+  const exceeded = pct >= 1;
+  return (
+    <div className={`banner ${exceeded ? 'error' : 'warn'}`}>
+      {exceeded
+        ? `${worst.label} hit the daily free-tier limit (${formatCount(worst.used)} / ${formatCount(worst.limit)}). Further operations will fail until the limit resets in ${formatResetIn(props.quota.resetAt, props.now)}.`
+        : `${worst.label} are at ${Math.round(pct * 100)}% of today's free-tier limit (${formatCount(worst.used)} / ${formatCount(worst.limit)}). Resets in ${formatResetIn(props.quota.resetAt, props.now)}.`}
+    </div>
+  );
+}
+
+function quotaBarClass(pct: number, exceeded: boolean): string {
+  if (exceeded) return 'quota-bar-fill exceeded';
+  if (pct >= 0.8) return 'quota-bar-fill high';
+  if (pct >= 0.5) return 'quota-bar-fill warn';
+  return 'quota-bar-fill';
+}
+
+function QuotaMeter(
+  props: Readonly<{ quota: QuotaSnapshot; now: number }>,
+) {
+  return (
+    <div className="field quota-card">
+      <span>Cloudflare free-tier usage</span>
+      <p className="muted note">
+        UTC day {props.quota.date}. Resets in{' '}
+        {formatResetIn(props.quota.resetAt, props.now)}.
+        {props.quota.source === 'cloudflare'
+          ? ' Account-wide from Cloudflare Analytics (KV is other projects on this account).'
+          : ' Durable Objects for this app only; KV is not included until an Analytics API token is set.'}
+      </p>
+      <ul className="quota-list">
+        {props.quota.metrics.map((metric) => {
+          const pct = Math.min(1, metricPercent(metric.used, metric.limit));
+          const exceeded = metric.used >= metric.limit;
+          return (
+            <li key={metric.key}>
+              <div className="quota-row">
+                <span>{metric.label}</span>
+                <span className={exceeded ? 'quota-exceeded' : undefined}>
+                  {formatCount(metric.used)} / {formatCount(metric.limit)}{' '}
+                  ({Math.round(metricPercent(metric.used, metric.limit) * 100)}%)
+                </span>
+              </div>
+              <div className="quota-bar" aria-hidden="true">
+                <div
+                  className={quotaBarClass(pct, exceeded)}
+                  style={{ width: `${Math.min(100, pct * 100)}%` }}
+                />
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      {props.quota.objects.length > 0 ? (
+        <p className="muted note">
+          Top objects:{' '}
+          {props.quota.objects
+            .slice(0, 4)
+            .map(
+              (object) =>
+                `${object.name} ${formatCount(object.rowsRead)} reads`,
+            )
+            .join(' · ')}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 function SettingsPanel(
   props: Readonly<{
     passcode: string;
     passcodeRequired: boolean;
     pushStatus: string;
     busy: boolean;
+    quota: QuotaSnapshot | null;
+    now: number;
     onPasscodeChange: (v: string) => void;
     onPasscodeBlur: () => void;
     onLock: () => void;
@@ -1443,6 +1660,7 @@ function SettingsPanel(
         Alert defaults and name display are under Streams (Global defaults at
         the top; each stream can override).
       </p>
+      {props.quota ? <QuotaMeter quota={props.quota} now={props.now} /> : null}
       {props.passcodeRequired ? (
         <div className="field">
           <span>Session</span>
@@ -1464,6 +1682,10 @@ function SettingsPanel(
       )}
       <div className="field">
         <span>Push notifications (Android Chrome)</span>
+        <p className="muted note">
+          The browser will also ask when you check in, so alerts work with the
+          phone locked.
+        </p>
         <div className="row">
           <button type="button" onClick={props.onEnablePush}>
             Enable push
@@ -1483,4 +1705,46 @@ function SettingsPanel(
 
 function isUnauthorized(err: unknown): boolean {
   return err instanceof Error && err.message.startsWith('401:');
+}
+
+async function ensureWebPush(
+  vapidPublicKey: string | null,
+  quiet = false,
+): Promise<string> {
+  if (!vapidPublicKey) {
+    return quiet ? '' : 'VAPID public key not configured on the Worker.';
+  }
+  if (
+    !('Notification' in window) ||
+    !('serviceWorker' in navigator) ||
+    !('PushManager' in window)
+  ) {
+    return quiet ? '' : 'Push not supported in this browser.';
+  }
+
+  let permission = Notification.permission;
+  if (permission === 'denied') {
+    return quiet ? '' : 'Notifications are blocked for this site.';
+  }
+
+  const asked = permission === 'default';
+  if (asked) {
+    permission = await Notification.requestPermission();
+  }
+  if (permission !== 'granted') {
+    return quiet ? '' : `Permission: ${permission}`;
+  }
+
+  const reg = await navigator.serviceWorker.ready;
+  const sub =
+    (await reg.pushManager.getSubscription()) ??
+    (await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(
+        vapidPublicKey,
+      ) as BufferSource,
+    }));
+  await subscribePush(sub.toJSON());
+  if (quiet && !asked) return '';
+  return 'Subscribed to push.';
 }

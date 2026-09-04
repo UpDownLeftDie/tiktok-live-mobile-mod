@@ -5,3 +5,6 @@ MOD_PASSCODE=dev-passcode
 # VAPID_PUBLIC_KEY=...
 # VAPID_PRIVATE_KEY={"kty":"EC",...}
 # VAPID_SUBJECT=mailto:you@example.com
+# Cloudflare token with Account Analytics:Read. Optional — without it the quota
+# panel falls back to counters the Durable Objects track themselves.
+# CF_API_TOKEN=...

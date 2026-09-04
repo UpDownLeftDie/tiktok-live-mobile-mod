@@ -30,11 +30,59 @@ import {
 } from '@tiktok-mod/shared';
 import { parseClientId } from './auth';
 import type { Env } from './env';
+import { TrackedSql } from './quota';
 
 const CHAT_LIMIT = 200;
 const EVENT_LIMIT = 200;
 const GIFT_LIMIT = 200;
 const GLOBAL_SETTINGS_TTL_MS = 10_000;
+const SEQ_KEY = 'feed:seq';
+const SEQ_BACKFILL_KEY = 'feed:seq:backfilled';
+const FEED_TABLES = ['chat_log', 'room_events', 'gift_log'] as const;
+type FeedTable = (typeof FEED_TABLES)[number];
+
+/**
+ * Trimming scans the tail of a log, so amortize it over several inserts
+ * instead of paying that scan on every incoming event.
+ */
+const TRIM_EVERY = 25;
+
+type ChatRow = {
+  id: string;
+  stream_id: string;
+  username: string | null;
+  comment: string;
+  flagged_keyword: string | null;
+  queue_item_id: string | null;
+  user_signals: string | null;
+  created_at: number;
+};
+
+type RoomRow = {
+  id: string;
+  stream_id: string;
+  type: string;
+  username: string | null;
+  nickname: string | null;
+  summary: string;
+  created_at: number;
+};
+
+type GiftRow = {
+  id: string;
+  stream_id: string;
+  sender_username: string | null;
+  sender_nickname: string | null;
+  gift_name: string | null;
+  gift_count: number;
+  diamond_value: number | null;
+  target_username: string | null;
+  target_nickname: string | null;
+  alert_status: string;
+  queue_item_id: string | null;
+  matched_rule: string | null;
+  created_at: number;
+};
 
 function uuid(): string {
   return crypto.randomUUID();
@@ -59,7 +107,10 @@ async function readWatcherBody(
 
 export class StreamSession implements DurableObject {
   private readonly env: Env;
+  private readonly tracked: TrackedSql;
   private migrated = false;
+  private seq: number | null = null;
+  private readonly insertsSinceTrim = new Map<FeedTable, number>();
   private globalSettingsCache: { value: GlobalSettings; fetchedAt: number } | null =
     null;
 
@@ -68,6 +119,7 @@ export class StreamSession implements DurableObject {
     env: Env,
   ) {
     this.env = env;
+    this.tracked = new TrackedSql(ctx);
   }
 
   private async ensureMigrated(): Promise<void> {
@@ -79,7 +131,7 @@ export class StreamSession implements DurableObject {
   }
 
   private migrate(): void {
-    this.ctx.storage.sql.exec(`
+    this.tracked.exec(`
       CREATE TABLE IF NOT EXISTS queue_items (
         id TEXT PRIMARY KEY,
         stream_id TEXT NOT NULL,
@@ -160,13 +212,64 @@ export class StreamSession implements DurableObject {
     this.ensureColumn('stream_config', 'status_updated_at', 'INTEGER');
     this.ensureColumn('stream_config', 'chat_highlights', 'TEXT');
     this.ensureColumn('room_events', 'nickname', 'TEXT');
+    for (const table of FEED_TABLES) {
+      this.ensureColumn(table, 'seq', 'INTEGER NOT NULL DEFAULT 0');
+      this.tracked.exec(
+        `CREATE INDEX IF NOT EXISTS idx_${table}_stream_seq
+         ON ${table} (stream_id, seq)`,
+      );
+    }
+    this.tracked.exec(
+      `CREATE INDEX IF NOT EXISTS idx_queue_items_stream_status
+       ON queue_items (stream_id, status, created_at)`,
+    );
+    this.backfillSeq();
     this.relaxStreamConfigNullability();
     this.migrateDefaultConfigsToInherit();
   }
 
+  /** Give pre-cursor rows distinct positions so trimming can order by seq. */
+  private backfillSeq(): void {
+    if (this.ctx.storage.kv.get(SEQ_BACKFILL_KEY) != null) return;
+    for (const table of FEED_TABLES) {
+      this.tracked.exec(`UPDATE ${table} SET seq = rowid WHERE seq = 0`);
+    }
+    this.ctx.storage.kv.put(SEQ_BACKFILL_KEY, 1);
+  }
+
+  /**
+   * Position in this stream's log, shared across chat/events/gifts so a single
+   * cursor covers all three. Bumped on edit so changed rows re-sync.
+   */
+  private nextSeq(): number {
+    const seq = this.currentSeq() + 1;
+    this.seq = seq;
+    this.ctx.storage.kv.put(SEQ_KEY, seq);
+    return seq;
+  }
+
+  private currentSeq(): number {
+    if (this.seq != null) return this.seq;
+    const stored = this.ctx.storage.kv.get<number>(SEQ_KEY);
+    if (stored != null) {
+      this.seq = Number(stored);
+      return this.seq;
+    }
+    let max = 0;
+    for (const table of FEED_TABLES) {
+      const row = this.tracked
+        .exec<{ max_seq: number | null }>(`SELECT MAX(seq) AS max_seq FROM ${table}`)
+        .one();
+      max = Math.max(max, Number(row.max_seq ?? 0));
+    }
+    this.ctx.storage.kv.put(SEQ_KEY, max);
+    this.seq = max;
+    return max;
+  }
+
   /** Recreate stream_config so alert columns can be NULL (inherit global). */
   private relaxStreamConfigNullability(): void {
-    const cols = this.ctx.storage.sql
+    const cols = this.tracked
       .exec<{ name: string; notnull: number }>(
         'PRAGMA table_info(stream_config)',
       )
@@ -174,7 +277,7 @@ export class StreamSession implements DurableObject {
     const giftCol = cols.find((c) => c.name === 'gift_alert_rules');
     if (!giftCol || giftCol.notnull === 0) return;
 
-    this.ctx.storage.sql.exec(`
+    this.tracked.exec(`
       CREATE TABLE stream_config_nullable (
         stream_id TEXT PRIMARY KEY,
         gift_alert_rules TEXT,
@@ -199,7 +302,7 @@ export class StreamSession implements DurableObject {
 
   private ensureColumn(table: string, column: string, typeSql: string): void {
     try {
-      this.ctx.storage.sql.exec(
+      this.tracked.exec(
         `ALTER TABLE ${table} ADD COLUMN ${column} ${typeSql}`,
       );
     } catch {
@@ -208,13 +311,13 @@ export class StreamSession implements DurableObject {
   }
 
   private ensureConfig(streamId: string): void {
-    const existing = this.ctx.storage.sql
+    const existing = this.tracked
       .exec<{
         stream_id: string;
       }>('SELECT stream_id FROM stream_config WHERE stream_id = ?', streamId)
       .toArray();
     if (existing.length > 0) return;
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO stream_config (
          stream_id, gift_alert_rules, chat_keyword_flags, chat_highlights,
          is_checked_in, connection_status, connection_detail, status_updated_at
@@ -226,7 +329,7 @@ export class StreamSession implements DurableObject {
 
   /** Clear stored defaults so streams inherit global settings. */
   private migrateDefaultConfigsToInherit(): void {
-    const rows = this.ctx.storage.sql
+    const rows = this.tracked
       .exec<{
         stream_id: string;
         gift_alert_rules: string | null;
@@ -245,7 +348,7 @@ export class StreamSession implements DurableObject {
       const parsed = parseStoredAlertSettings(row);
       if (!parsed) continue;
       if (!isDefaultAlertSettings(parsed)) continue;
-      this.ctx.storage.sql.exec(
+      this.tracked.exec(
         `UPDATE stream_config
          SET gift_alert_rules = NULL, chat_keyword_flags = NULL, chat_highlights = NULL
          WHERE stream_id = ?`,
@@ -279,7 +382,7 @@ export class StreamSession implements DurableObject {
 
   private readOverrides(streamId: string): AlertSettingsOverrides {
     this.ensureConfig(streamId);
-    const row = this.ctx.storage.sql
+    const row = this.tracked
       .exec<{
         gift_alert_rules: string | null;
         chat_keyword_flags: string | null;
@@ -330,7 +433,7 @@ export class StreamSession implements DurableObject {
 
   private async getResolvedConfig(streamId: string): Promise<StreamConfig> {
     this.ensureConfig(streamId);
-    const row = this.ctx.storage.sql
+    const row = this.tracked
       .exec<{
         stream_id: string;
         is_checked_in: number;
@@ -354,7 +457,7 @@ export class StreamSession implements DurableObject {
     detail?: string | null,
   ): void {
     this.ensureConfig(streamId);
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `UPDATE stream_config
        SET connection_status = ?, connection_detail = ?, status_updated_at = ?
        WHERE stream_id = ?`,
@@ -376,6 +479,10 @@ export class StreamSession implements DurableObject {
         { error: err instanceof Error ? err.message : 'internal error' },
         { status: 500 },
       );
+    } finally {
+      this.ctx.waitUntil(
+        Promise.resolve().then(() => this.tracked.flush()),
+      );
     }
   }
 
@@ -394,8 +501,13 @@ export class StreamSession implements DurableObject {
         return this.handleSyncCheck(streamId, request);
       case 'POST /events':
         return this.handleEvent(streamId, (await request.json()) as RelayEvent);
+      case 'GET /quota':
+        return Response.json(this.tracked.snapshot());
       case 'GET /live':
-        return this.handleGetLive(streamId);
+        return this.handleGetLive(
+          streamId,
+          parseCursor(url.searchParams.get('since')),
+        );
       case 'GET /queue':
         return this.handleGetQueue(
           streamId,
@@ -528,14 +640,14 @@ export class StreamSession implements DurableObject {
 
   private applyCheckedIn(streamId: string, isCheckedIn: boolean): void {
     this.ensureConfig(streamId);
-    const row = this.ctx.storage.sql
+    const row = this.tracked
       .exec<{ is_checked_in: number }>(
         'SELECT is_checked_in FROM stream_config WHERE stream_id = ?',
         streamId,
       )
       .one();
     const was = row.is_checked_in === 1;
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       'UPDATE stream_config SET is_checked_in = ? WHERE stream_id = ?',
       isCheckedIn ? 1 : 0,
       streamId,
@@ -582,9 +694,9 @@ export class StreamSession implements DurableObject {
   }
 
   private handleRoom(streamId: string, event: RelayRoomEvent): Response {
-    this.ctx.storage.sql.exec(
-      `INSERT INTO room_events (id, stream_id, type, username, nickname, summary, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    this.tracked.exec(
+      `INSERT INTO room_events (id, stream_id, type, username, nickname, summary, created_at, seq)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       event.eventId,
       streamId,
       event.type,
@@ -592,6 +704,7 @@ export class StreamSession implements DurableObject {
       event.nickname ?? null,
       event.summary,
       event.createdAt,
+      this.nextSeq(),
     );
     this.trimTable('room_events', streamId, EVENT_LIMIT);
     return Response.json({ ok: true });
@@ -628,11 +741,11 @@ export class StreamSession implements DurableObject {
       matchedRule = matched.label;
     }
 
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO gift_log (
          id, stream_id, sender_username, sender_nickname, gift_name, gift_count, diamond_value,
-         target_username, target_nickname, alert_status, queue_item_id, matched_rule, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         target_username, target_nickname, alert_status, queue_item_id, matched_rule, created_at, seq
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       event.eventId,
       streamId,
       event.senderUsername,
@@ -646,6 +759,7 @@ export class StreamSession implements DurableObject {
       queueItemId,
       matchedRule,
       event.createdAt,
+      this.nextSeq(),
     );
     this.trimTable('gift_log', streamId, GIFT_LIMIT);
 
@@ -700,11 +814,11 @@ export class StreamSession implements DurableObject {
       );
     }
 
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO chat_log (
          id, stream_id, username, comment, flagged_keyword, queue_item_id,
-         is_new_chatter, user_signals, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         is_new_chatter, user_signals, created_at, seq
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       event.eventId,
       streamId,
       event.username,
@@ -714,6 +828,7 @@ export class StreamSession implements DurableObject {
       0,
       event.userSignals ? JSON.stringify(event.userSignals) : null,
       event.createdAt,
+      this.nextSeq(),
     );
     this.trimTable('chat_log', streamId, CHAT_LIMIT);
 
@@ -759,23 +874,28 @@ export class StreamSession implements DurableObject {
     return Response.json({ ok: true });
   }
 
-  private trimTable(
-    table: 'chat_log' | 'room_events' | 'gift_log',
-    streamId: string,
-    keep: number,
-  ): void {
-    this.ctx.storage.sql.exec(
-      `DELETE FROM ${table}
-       WHERE stream_id = ?
-         AND id NOT IN (
-           SELECT id FROM ${table}
-           WHERE stream_id = ?
-           ORDER BY created_at DESC
-           LIMIT ?
-         )`,
+  private trimTable(table: FeedTable, streamId: string, keep: number): void {
+    const pending = (this.insertsSinceTrim.get(table) ?? 0) + 1;
+    if (pending < TRIM_EVERY) {
+      this.insertsSinceTrim.set(table, pending);
+      return;
+    }
+    this.insertsSinceTrim.set(table, 0);
+
+    const cutoff = this.tracked
+      .exec<{ seq: number }>(
+        `SELECT seq FROM ${table} WHERE stream_id = ?
+         ORDER BY seq DESC LIMIT 1 OFFSET ?`,
+        streamId,
+        keep - 1,
+      )
+      .toArray()[0];
+    if (!cutoff) return;
+
+    this.tracked.exec(
+      `DELETE FROM ${table} WHERE stream_id = ? AND seq < ?`,
       streamId,
-      streamId,
-      keep,
+      cutoff.seq,
     );
   }
 
@@ -786,7 +906,7 @@ export class StreamSession implements DurableObject {
     createdAt: number,
   ): Promise<string> {
     const id = uuid();
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `INSERT INTO queue_items (id, stream_id, type, status, payload, created_at)
        VALUES (?, ?, ?, 'pending', ?, ?)`,
       id,
@@ -798,9 +918,12 @@ export class StreamSession implements DurableObject {
     return id;
   }
 
-  private async handleGetLive(streamId: string): Promise<Response> {
+  private async handleGetLive(
+    streamId: string,
+    since: number | null,
+  ): Promise<Response> {
     const config = await this.getResolvedConfig(streamId);
-    const cfg = this.ctx.storage.sql
+    const cfg = this.tracked
       .exec<{
         connection_status: string;
         connection_detail: string | null;
@@ -811,23 +934,17 @@ export class StreamSession implements DurableObject {
       )
       .one();
 
-    const chatRows = this.ctx.storage.sql
-      .exec<{
-        id: string;
-        stream_id: string;
-        username: string | null;
-        comment: string;
-        flagged_keyword: string | null;
-        queue_item_id: string | null;
-        user_signals: string | null;
-        created_at: number;
-      }>(
-        `SELECT * FROM chat_log WHERE stream_id = ?
-         ORDER BY created_at DESC LIMIT ?`,
-        streamId,
-        CHAT_LIMIT,
-      )
-      .toArray();
+    const cursor = this.currentSeq();
+    // A cursor ahead of ours means the client is talking to a reset log; fall
+    // back to a snapshot rather than silently starving it of rows.
+    const from = since != null && since <= cursor ? since : null;
+
+    const chatRows = this.readFeedRows<ChatRow>(
+      'chat_log',
+      streamId,
+      from,
+      CHAT_LIMIT,
+    );
 
     const queueStatuses = this.queueStatusMap(
       chatRows.map((r) => r.queue_item_id).filter(Boolean) as string[],
@@ -847,55 +964,27 @@ export class StreamSession implements DurableObject {
       createdAt: r.created_at,
     }));
 
-    const events: RoomLogItem[] = this.ctx.storage.sql
-      .exec<{
-        id: string;
-        stream_id: string;
-        type: string;
-        username: string | null;
-        nickname: string | null;
-        summary: string;
-        created_at: number;
-      }>(
-        `SELECT * FROM room_events WHERE stream_id = ?
-         ORDER BY created_at DESC LIMIT ?`,
-        streamId,
-        EVENT_LIMIT,
-      )
-      .toArray()
-      .map((r) => ({
-        id: r.id,
-        streamId: r.stream_id,
-        type: r.type as RoomLogItem['type'],
-        username: r.username,
-        nickname: r.nickname ?? null,
-        summary: r.summary,
-        createdAt: r.created_at,
-      }));
+    const events: RoomLogItem[] = this.readFeedRows<RoomRow>(
+      'room_events',
+      streamId,
+      from,
+      EVENT_LIMIT,
+    ).map((r) => ({
+      id: r.id,
+      streamId: r.stream_id,
+      type: r.type as RoomLogItem['type'],
+      username: r.username,
+      nickname: r.nickname ?? null,
+      summary: r.summary,
+      createdAt: r.created_at,
+    }));
 
-    const gifts: GiftLogItem[] = this.ctx.storage.sql
-      .exec<{
-        id: string;
-        stream_id: string;
-        sender_username: string | null;
-        sender_nickname: string | null;
-        gift_name: string | null;
-        gift_count: number;
-        diamond_value: number | null;
-        target_username: string | null;
-        target_nickname: string | null;
-        alert_status: string;
-        queue_item_id: string | null;
-        matched_rule: string | null;
-        created_at: number;
-      }>(
-        `SELECT * FROM gift_log WHERE stream_id = ?
-         ORDER BY created_at DESC LIMIT ?`,
-        streamId,
-        GIFT_LIMIT,
-      )
-      .toArray()
-      .map((r) => ({
+    const gifts: GiftLogItem[] = this.readFeedRows<GiftRow>(
+      'gift_log',
+      streamId,
+      from,
+      GIFT_LIMIT,
+    ).map((r) => ({
         id: r.id,
         streamId: r.stream_id,
         senderUsername: r.sender_username,
@@ -924,28 +1013,62 @@ export class StreamSession implements DurableObject {
       chat,
       events,
       gifts,
+      cursor,
+      incremental: from != null,
     };
     return Response.json(feed);
   }
 
+  /**
+   * Rows changed since `since`, or the most recent `limit` when starting fresh.
+   * Both paths ride an index, so an idle poll reads next to nothing.
+   */
+  private readFeedRows<T extends Record<string, SqlStorageValue>>(
+    table: FeedTable,
+    streamId: string,
+    since: number | null,
+    limit: number,
+  ): T[] {
+    if (since != null) {
+      return this.tracked
+        .exec<T>(
+          `SELECT * FROM ${table} WHERE stream_id = ? AND seq > ?
+           ORDER BY seq ASC LIMIT ?`,
+          streamId,
+          since,
+          limit,
+        )
+        .toArray();
+    }
+    return this.tracked
+      .exec<T>(
+        `SELECT * FROM ${table} WHERE stream_id = ?
+         ORDER BY created_at DESC LIMIT ?`,
+        streamId,
+        limit,
+      )
+      .toArray();
+  }
+
   private queueStatusMap(ids: string[]): Map<string, QueueItemStatus> {
     const map = new Map<string, QueueItemStatus>();
-    if (ids.length === 0) return map;
-    for (const id of ids) {
-      const rows = this.ctx.storage.sql
-        .exec<{
-          status: string;
-        }>('SELECT status FROM queue_items WHERE id = ?', id)
-        .toArray();
-      if (rows[0]) {
-        map.set(id, rows[0].status as QueueItemStatus);
-      }
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return map;
+    const rows = this.tracked
+      .exec<{ id: string; status: string }>(
+        `SELECT id, status FROM queue_items
+         WHERE id IN (${unique.map(() => '?').join(', ')})`,
+        ...unique,
+      )
+      .toArray();
+    for (const row of rows) {
+      map.set(row.id, row.status as QueueItemStatus);
     }
     return map;
   }
 
   private handleGetQueue(streamId: string, want = 'pending'): Response {
-    const rows = this.ctx.storage.sql
+    const rows = this.tracked
       .exec<{
         id: string;
         stream_id: string;
@@ -976,20 +1099,32 @@ export class StreamSession implements DurableObject {
   }
 
   private handleMarkDone(streamId: string, itemId: string): Response {
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `UPDATE queue_items SET status = 'done', resolved_at = ?
        WHERE id = ? AND stream_id = ?`,
       Date.now(),
       itemId,
       streamId,
     );
-    this.ctx.storage.sql.exec(
-      `UPDATE gift_log SET alert_status = 'done'
+    this.tracked.exec(
+      `UPDATE gift_log SET alert_status = 'done', seq = ?
        WHERE queue_item_id = ? AND stream_id = ?`,
+      this.nextSeq(),
       itemId,
       streamId,
     );
+    this.touchChatForQueueItem(streamId, itemId);
     return Response.json({ ok: true, id: itemId, status: 'done' });
+  }
+
+  /** Chat rows carry the queue status, so republish them when it changes. */
+  private touchChatForQueueItem(streamId: string, itemId: string): void {
+    this.tracked.exec(
+      'UPDATE chat_log SET seq = ? WHERE queue_item_id = ? AND stream_id = ?',
+      this.nextSeq(),
+      itemId,
+      streamId,
+    );
   }
 
   private handleSetGiftStatuses(streamId: string, body: unknown): Response {
@@ -1024,7 +1159,7 @@ export class StreamSession implements DurableObject {
         ? (body as { status: 'pending' | 'done' }).status
         : 'done';
 
-    const row = this.ctx.storage.sql
+    const row = this.tracked
       .exec<{
         queue_item_id: string | null;
       }>(
@@ -1037,17 +1172,18 @@ export class StreamSession implements DurableObject {
       return Response.json({ error: 'gift not found' }, { status: 404 });
     }
 
-    this.ctx.storage.sql.exec(
-      `UPDATE gift_log SET alert_status = ?
+    this.tracked.exec(
+      `UPDATE gift_log SET alert_status = ?, seq = ?
        WHERE id = ? AND stream_id = ?`,
       status,
+      this.nextSeq(),
       giftId,
       streamId,
     );
 
     if (row.queue_item_id) {
       if (status === 'done') {
-        this.ctx.storage.sql.exec(
+        this.tracked.exec(
           `UPDATE queue_items SET status = 'done', resolved_at = ?
            WHERE id = ? AND stream_id = ?`,
           Date.now(),
@@ -1055,13 +1191,14 @@ export class StreamSession implements DurableObject {
           streamId,
         );
       } else {
-        this.ctx.storage.sql.exec(
+        this.tracked.exec(
           `UPDATE queue_items SET status = 'pending', resolved_at = NULL
            WHERE id = ? AND stream_id = ?`,
           row.queue_item_id,
           streamId,
         );
       }
+      this.touchChatForQueueItem(streamId, row.queue_item_id);
     }
 
     return Response.json({
@@ -1110,7 +1247,7 @@ export class StreamSession implements DurableObject {
   }
 
   private clearAllOverrides(streamId: string): void {
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `UPDATE stream_config
        SET gift_alert_rules = NULL, chat_keyword_flags = NULL, chat_highlights = NULL
        WHERE stream_id = ?`,
@@ -1123,7 +1260,7 @@ export class StreamSession implements DurableObject {
     streamId: string,
     value: unknown,
   ): void {
-    this.ctx.storage.sql.exec(
+    this.tracked.exec(
       `UPDATE stream_config SET ${column} = ? WHERE stream_id = ?`,
       value == null ? null : JSON.stringify(value),
       streamId,
@@ -1214,6 +1351,12 @@ function parseStoredAlertSettings(row: {
   } catch {
     return null;
   }
+}
+
+function parseCursor(raw: string | null): number | null {
+  if (raw == null || raw === '') return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 function parseUserSignals(raw: string | null): ChatUserSignals | null {

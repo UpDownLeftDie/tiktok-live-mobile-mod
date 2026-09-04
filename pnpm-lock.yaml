@@ -17,6 +17,9 @@ importers:
       eslint-plugin-sonarjs:
         specifier: ^4.2.0
         version: 4.2.0(eslint@10.9.1(supports-color@10.2.2))
+      globals:
+        specifier: ^17.12.0
+        version: 17.12.0
       typescript:
         specifier: ~6.0.3
         version: 6.0.3
@@ -2117,8 +2120,8 @@ packages:
     deprecated: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
     hasBin: true
 
-  globals@17.11.0:
-    resolution: {integrity: sha512-Z2I8hM+PbJDXQDq3Icgpzv+mPdwr68iZUU9d5WW4FuXfDUQfkZaZuvjMv42/5crNyw154+9+VWXbYrUgDXbxNw==}
+  globals@17.12.0:
+    resolution: {integrity: sha512-cezEd/DTyyht9cvSSURyygXPfy04GtWO/5e6ZPvH7fCtjKz9PYOmuawphw1Ctd1f6C+5JypXfGD7ahNMXvevBA==}
     engines: {node: '>=18'}
 
   globalthis@1.0.4:
@@ -4948,7 +4951,7 @@ snapshots:
       bytes: 3.1.2
       eslint: 10.9.1(supports-color@10.2.2)
       functional-red-black-tree: 1.0.1
-      globals: 17.11.0
+      globals: 17.12.0
       jsx-ast-utils-x: 0.1.0
       lodash.merge: 4.6.2
       minimatch: 10.2.6
@@ -5155,7 +5158,7 @@ snapshots:
       package-json-from-dist: 1.0.1
       path-scurry: 2.0.2
 
-  globals@17.11.0: {}
+  globals@17.12.0: {}
 
   globalthis@1.0.4:
     dependencies:
