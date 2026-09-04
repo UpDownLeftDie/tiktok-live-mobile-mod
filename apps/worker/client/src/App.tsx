@@ -1210,24 +1210,28 @@ function ChatList(
         return (
           <div key={item.id} className={classes}>
             <FeedTime at={item.createdAt} />
-            <div className="feed-line-main">
-              <span className="chat-user">
-                {formatPersonLabel(
-                  item.username,
-                  item.userSignals?.nickname,
-                  props.nameDisplayMode,
-                  'anon',
-                )}
+            <div className="feed-line-main chat-line-main">
+              <span className="chat-meta">
+                <span className="chat-user">
+                  {formatPersonLabel(
+                    item.username,
+                    item.userSignals?.nickname,
+                    props.nameDisplayMode,
+                    'anon',
+                  )}
+                </span>
+                <ChatSignalTags signals={item.userSignals} />
               </span>
-              <ChatSignalTags signals={item.userSignals} />
-              <span className="chat-body">{item.comment}</span>
-              {watched ? <span className="tag"> watch</span> : null}
-              {recentGifter ? (
-                <span className="tag tag-gift"> gifted</span>
-              ) : null}
-              {item.flaggedKeyword ? (
-                <span className="tag"> {item.flaggedKeyword}</span>
-              ) : null}
+              <span className="chat-comment">
+                <span className="chat-body">{item.comment}</span>
+                {watched ? <span className="tag"> watch</span> : null}
+                {recentGifter ? (
+                  <span className="tag tag-gift"> gifted</span>
+                ) : null}
+                {item.flaggedKeyword ? (
+                  <span className="tag"> {item.flaggedKeyword}</span>
+                ) : null}
+              </span>
             </div>
             {pending && item.queueItemId ? (
               <button
