@@ -1596,8 +1596,8 @@ function QuotaMeter(
         UTC day {props.quota.date}. Resets in{' '}
         {formatResetIn(props.quota.resetAt, props.now)}.
         {props.quota.source === 'cloudflare'
-          ? ' Account-wide from Cloudflare Analytics (KV is other projects on this account).'
-          : ' Durable Objects for this app only; KV is not included until an Analytics API token is set.'}
+          ? ' Billed totals from Cloudflare Analytics.'
+          : ' Counted by this app; set an Analytics API token for billed totals.'}
       </p>
       <ul className="quota-list">
         {props.quota.metrics.map((metric) => {

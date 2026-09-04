@@ -36,4 +36,4 @@ new_sqlite_classes = ["StreamSession", "Registry"]
 #   VAPID_PRIVATE_KEY
 #   VAPID_SUBJECT   (e.g. mailto:you@example.com)
 #   CF_ACCOUNT_ID   (optional; pairs with CF_API_TOKEN for the quota panel)
-#   CF_API_TOKEN    (Account Analytics Read — optional; enables KV + billing-accurate DO usage)
+#   CF_API_TOKEN    (Account Analytics Read — optional; billing-accurate DO usage)

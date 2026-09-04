@@ -79,9 +79,10 @@ npx wrangler secret put CF_ACCOUNT_ID
 npx wrangler secret put CF_API_TOKEN          # token with Account Analytics:Read
 ```
 
-With both set, the panel reports billing-accurate KV and Durable Objects usage.
-Without them it falls back to counters the Durable Objects track themselves,
-which only cover this Worker. For local dev, put the same pair in `.dev.vars`.
+With both set, the panel reports the Durable Objects rows Cloudflare actually
+bills. Without them it falls back to counters the Durable Objects keep
+themselves, which drift from the billed figure. For local dev, put the same pair
+in `.dev.vars`.
 
 Note the Worker URL (e.g. `https://tiktok-live-mod.<account>.workers.dev`).
 

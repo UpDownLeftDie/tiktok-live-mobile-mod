@@ -4,10 +4,6 @@ import type { Env } from './env';
 export const FREE_TIER_LIMITS = {
   doRowsRead: 5_000_000,
   doRowsWritten: 100_000,
-  kvRead: 100_000,
-  kvWrite: 1_000,
-  kvDelete: 1_000,
-  kvList: 1_000,
 } as const;
 
 export type QuotaMetric = {
@@ -60,7 +56,6 @@ function snapshotFromCounts(
   doRowsRead: number,
   doRowsWritten: number,
   objects: QuotaObject[],
-  kv?: { read: number; write: number; delete: number; list: number },
 ): QuotaSnapshot {
   const metrics: QuotaMetric[] = [
     metric(
@@ -76,14 +71,6 @@ function snapshotFromCounts(
       FREE_TIER_LIMITS.doRowsWritten,
     ),
   ];
-  if (kv) {
-    metrics.push(
-      metric('kvRead', 'KV reads', kv.read, FREE_TIER_LIMITS.kvRead),
-      metric('kvWrite', 'KV writes', kv.write, FREE_TIER_LIMITS.kvWrite),
-      metric('kvDelete', 'KV deletes', kv.delete, FREE_TIER_LIMITS.kvDelete),
-      metric('kvList', 'KV lists', kv.list, FREE_TIER_LIMITS.kvList),
-    );
-  }
   return {
     source,
     date: utcDateString(),
@@ -210,13 +197,6 @@ async function fetchCloudflareSnapshot(env: Env): Promise<QuotaSnapshot> {
             dimensions { name namespaceId }
             sum { rowsRead rowsWritten }
           }
-          kvOperationsAdaptiveGroups(
-            filter: { date: $date }
-            limit: 100
-          ) {
-            dimensions { actionType }
-            sum { requests }
-          }
         }
       }
     }
@@ -242,10 +222,6 @@ async function fetchCloudflareSnapshot(env: Env): Promise<QuotaSnapshot> {
           durableObjectsPeriodicGroups?: Array<{
             dimensions: { name: string | null };
             sum: { rowsRead: number | null; rowsWritten: number | null };
-          }>;
-          kvOperationsAdaptiveGroups?: Array<{
-            dimensions: { actionType: string | null };
-            sum: { requests: number | null };
           }>;
         }>;
       };
@@ -274,22 +250,11 @@ async function fetchCloudflareSnapshot(env: Env): Promise<QuotaSnapshot> {
   }
   objects.sort((a, b) => b.rowsRead - a.rowsRead);
 
-  const kv = { read: 0, write: 0, delete: 0, list: 0 };
-  for (const row of account.kvOperationsAdaptiveGroups ?? []) {
-    const n = row.sum.requests ?? 0;
-    const action = (row.dimensions.actionType ?? '').toLowerCase();
-    if (action === 'read') kv.read += n;
-    else if (action === 'write') kv.write += n;
-    else if (action === 'delete') kv.delete += n;
-    else if (action === 'list') kv.list += n;
-  }
-
   return snapshotFromCounts(
     'cloudflare',
     doRowsRead,
     doRowsWritten,
     objects.slice(0, 8),
-    kv,
   );
 }
 
