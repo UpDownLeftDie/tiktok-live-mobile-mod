@@ -73,6 +73,32 @@ export function fetchPublicConfig(): Promise<PublicConfig> {
   );
 }
 
+/** Validates the stored passcode without touching Durable Object storage. */
+export function checkPasscode(): Promise<{ ok: true }> {
+  return api('/api/auth-check');
+}
+
+export function isUnauthorized(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith('401:');
+}
+
+export function isQuotaExceeded(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return (
+    err.message.includes('quota_exceeded') ||
+    /Exceeded allowed rows/i.test(err.message)
+  );
+}
+
+export function friendlyApiError(err: unknown): string {
+  if (isUnauthorized(err)) return 'Incorrect passcode.';
+  if (isQuotaExceeded(err)) {
+    return 'Daily Durable Objects quota is exhausted. The app will work again after 00:00 UTC.';
+  }
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
 export function listStreams(): Promise<{
   streams: Array<{
     streamId: string;

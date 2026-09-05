@@ -49,3 +49,31 @@ export function dedupeGiftCatalogByName(
 export const GIFT_CATALOG: GiftCatalogItem[] = dedupeGiftCatalogByName(
   raw as GiftCatalogItem[],
 );
+
+/** Id → name from the raw catalog (before name dedupe) so seasonal renames still resolve. */
+const GIFT_NAME_BY_ID = (() => {
+  const byId = new Map<number, string>();
+  for (const gift of raw as GiftCatalogItem[]) {
+    if (gift.id == null) continue;
+    const name = gift.name?.trim();
+    if (!name || byId.has(gift.id)) continue;
+    byId.set(gift.id, name);
+  }
+  return byId;
+})();
+
+/**
+ * Prefer the catalog name for a TikTok gift id (stable) over the payload
+ * display string, which can be a seasonal/marketing label.
+ */
+export function resolveCatalogGiftName(
+  giftId: number | null | undefined,
+  fallbackName: string | null | undefined,
+): string | null {
+  if (giftId != null) {
+    const catalogName = GIFT_NAME_BY_ID.get(giftId);
+    if (catalogName) return catalogName;
+  }
+  const fallback = fallbackName?.trim();
+  return fallback || null;
+}

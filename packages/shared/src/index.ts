@@ -34,7 +34,11 @@ export interface GiftAlertRule {
   notify?: boolean;
 }
 
-export { dedupeGiftCatalogByName, GIFT_CATALOG } from './gift-catalog.js';
+export {
+  dedupeGiftCatalogByName,
+  GIFT_CATALOG,
+  resolveCatalogGiftName,
+} from './gift-catalog.js';
 export type { GiftCatalogItem } from './gift-catalog.js';
 
 export interface ChatHighlightConfig {

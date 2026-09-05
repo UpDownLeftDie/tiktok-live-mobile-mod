@@ -1,6 +1,6 @@
 import { requireModAuth, requireRelayAuth, registryStub, streamStub } from "./auth";
 import type { Env } from "./env";
-import { fetchQuotaSnapshot } from "./quota";
+import { fetchQuotaSnapshot, quotaExceededResponse } from "./quota";
 
 export { StreamSession } from "./stream-session";
 export { Registry } from "./registry";
@@ -308,6 +308,12 @@ async function handleApi(
     });
   }
 
+  if (request.method === "GET" && pathname === "/api/auth-check") {
+    const denied = requireModAuth(request, env);
+    if (denied) return denied;
+    return json({ ok: true });
+  }
+
   const relay = await handleRelayRoutes(request, env, pathname);
   if (relay) return relay;
 
@@ -328,10 +334,16 @@ async function handleApi(
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) {
-      return handleApi(request, env, url);
+    try {
+      const url = new URL(request.url);
+      if (url.pathname.startsWith("/api/")) {
+        return await handleApi(request, env, url);
+      }
+      return env.ASSETS.fetch(request);
+    } catch (err) {
+      const quota = quotaExceededResponse(err);
+      if (quota) return quota;
+      throw err;
     }
-    return env.ASSETS.fetch(request);
   },
 };

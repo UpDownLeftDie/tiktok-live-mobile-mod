@@ -321,6 +321,20 @@ async function readDoQuota(
   }
 }
 
+export function quotaExceededResponse(err: unknown): Response | null {
+  const message = err instanceof Error ? err.message : String(err);
+  if (!/Exceeded allowed rows/i.test(message)) return null;
+  return Response.json(
+    {
+      error: 'quota_exceeded',
+      message:
+        'Durable Objects free-tier row reads are exhausted until 00:00 UTC.',
+      resetAt: nextUtcMidnightIso(),
+    },
+    { status: 503 },
+  );
+}
+
 export async function fetchQuotaSnapshot(env: Env): Promise<QuotaSnapshot> {
   const date = utcDateString();
   const cacheKey = new Request(`https://tiktok-live-mod.quota/${date}`);

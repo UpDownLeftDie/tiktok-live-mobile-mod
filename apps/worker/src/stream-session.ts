@@ -6,6 +6,7 @@ import {
   giftDiamondSpend,
   isDefaultAlertSettings,
   resolveAlertSettings,
+  resolveCatalogGiftName,
   type AlertSettingsOverrides,
   type ChatHighlightConfig,
   type ChatLogItem,
@@ -263,6 +264,12 @@ export class StreamSession implements DurableObject {
     this.backfillSeq();
     this.relaxStreamConfigNullability();
     this.migrateDefaultConfigsToInherit();
+    // Old rows have no gift_id; rename known seasonal aliases only.
+    this.tracked.exec(
+      `UPDATE gift_log
+       SET gift_name = 'Lightning Bolt'
+       WHERE lower(gift_name) = 'autumn 2024'`,
+    );
   }
 
   /** Give pre-cursor rows distinct positions so trimming can order by seq. */
@@ -828,7 +835,9 @@ export class StreamSession implements DurableObject {
     config: StreamConfig,
     event: RelayGiftEvent,
   ): Promise<Response> {
-    const matched = matchGiftRule(config.giftAlertRules, event);
+    const giftName = resolveCatalogGiftName(event.giftId, event.giftName);
+    const resolved: RelayGiftEvent = { ...event, giftName };
+    const matched = matchGiftRule(config.giftAlertRules, resolved);
     let queueItemId: string | null = null;
     const alertStatus: 'none' | 'pending' = 'pending';
     let matchedRule: string | null = null;
@@ -838,7 +847,7 @@ export class StreamSession implements DurableObject {
       const payload: QueueItemPayload = {
         senderUsername: event.senderUsername,
         senderNickname,
-        giftName: event.giftName,
+        giftName,
         giftCount: event.giftCount,
         diamondValue: event.diamondValue,
         targetUsername: event.targetUsername,
@@ -863,7 +872,7 @@ export class StreamSession implements DurableObject {
       streamId,
       event.senderUsername,
       senderNickname,
-      event.giftName,
+      giftName,
       event.giftCount,
       event.diamondValue,
       event.targetUsername,
@@ -886,6 +895,7 @@ export class StreamSession implements DurableObject {
           {
             ...event,
             senderNickname,
+            giftName,
           },
           mode,
         ),
