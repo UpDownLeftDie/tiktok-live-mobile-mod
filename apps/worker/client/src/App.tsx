@@ -26,11 +26,14 @@ import {
   addStream,
   checkIn,
   checkOut,
+  checkPasscode,
   DEFAULT_CHAT_HIGHLIGHTS,
   fetchPublicConfig,
   fetchQuota,
+  friendlyApiError,
   getLiveFeed,
   getPasscode,
+  isUnauthorized,
   listStreams,
   markDone,
   markGiftDone,
@@ -160,6 +163,40 @@ function giftMatchesFeedFilter(
   if (activeTypes.size === 0) return true;
   const name = item.giftName?.toLowerCase();
   return Boolean(name && activeTypes.has(name));
+}
+
+type GiftUserFilterMode = 'all' | 'to' | 'from';
+
+function personMatchesQuery(
+  username: string | null,
+  nickname: string | null,
+  query: string,
+): boolean {
+  if (username?.toLowerCase().includes(query)) return true;
+  if (nickname?.toLowerCase().includes(query)) return true;
+  return false;
+}
+
+function giftMatchesUserFilter(
+  item: GiftLogItem,
+  mode: GiftUserFilterMode,
+  query: string,
+): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  const fromMatch = personMatchesQuery(
+    item.senderUsername,
+    item.senderNickname,
+    q,
+  );
+  const toMatch = personMatchesQuery(
+    item.targetUsername,
+    item.targetNickname,
+    q,
+  );
+  if (mode === 'from') return fromMatch;
+  if (mode === 'to') return toMatch;
+  return fromMatch || toMatch;
 }
 
 type ChatFilterKind = 'flagged' | 'watch' | 'gifter' | 'mod' | 'sub' | 'follow';
@@ -293,15 +330,23 @@ export function App() {
         const stored = getPasscode();
         if (stored) {
           try {
-            await listStreams();
+            await checkPasscode();
             setBoot({
               phase: 'ready',
               passcodeRequired: true,
               vapidPublicKey: cfg.vapidPublicKey,
             });
             return;
-          } catch {
-            setPasscode('');
+          } catch (err) {
+            if (isUnauthorized(err)) {
+              setPasscode('');
+            } else {
+              setBoot({
+                phase: 'error',
+                message: friendlyApiError(err),
+              });
+              return;
+            }
           }
         }
         setBoot({ phase: 'locked', vapidPublicKey: cfg.vapidPublicKey });
@@ -381,11 +426,15 @@ function PasscodeGate(
     setError(null);
     setPasscode(value.trim());
     try {
-      await listStreams();
+      await checkPasscode();
       props.onUnlocked(props.vapidPublicKey);
-    } catch {
-      setPasscode('');
-      setError('Incorrect passcode.');
+    } catch (err) {
+      if (isUnauthorized(err)) {
+        setPasscode('');
+        setError('Incorrect passcode.');
+      } else {
+        setError(friendlyApiError(err));
+      }
     } finally {
       setBusy(false);
     }
@@ -524,7 +573,7 @@ function ModApp(
       setTab('live');
     }
     void refreshStreams().catch((err: unknown) =>
-      setError(err instanceof Error ? err.message : String(err)),
+      setError(friendlyApiError(err)),
     );
   }, [refreshStreams]);
 
@@ -833,6 +882,9 @@ function LivePanel(
   const [giftTypeFilters, setGiftTypeFilters] = useState<Set<string>>(
     () => new Set(),
   );
+  const [giftUserFilterMode, setGiftUserFilterMode] =
+    useState<GiftUserFilterMode>('all');
+  const [giftUserQuery, setGiftUserQuery] = useState('');
   const [bulkUndoIds, setBulkUndoIds] = useState<string[]>([]);
 
   const checkedInStreams = useMemo(
@@ -937,8 +989,10 @@ function LivePanel(
   );
   const giftMinDiamonds =
     giftMinDiamondsText === '' ? 0 : Number(giftMinDiamondsText);
-  const filteredGifts = props.feed.gifts.filter((g) =>
-    giftMatchesFeedFilter(g, giftMinDiamonds, giftTypeFilters),
+  const filteredGifts = props.feed.gifts.filter(
+    (g) =>
+      giftMatchesFeedFilter(g, giftMinDiamonds, giftTypeFilters) &&
+      giftMatchesUserFilter(g, giftUserFilterMode, giftUserQuery),
   );
   const importantTypes = new Set(enabledGiftNames.map((n) => n.toLowerCase()));
 
@@ -1028,12 +1082,15 @@ function LivePanel(
                 : 'No matching gifts.'
             }
             importantTypes={importantTypes}
-            hostUsername={props.selected}
             nameDisplayMode={
               props.feed.nameDisplayMode ?? DEFAULT_NAME_DISPLAY_MODE
             }
             busy={props.busy}
             bulkUndoIds={bulkUndoIds}
+            userFilterMode={giftUserFilterMode}
+            userQuery={giftUserQuery}
+            onUserFilterModeChange={setGiftUserFilterMode}
+            onUserQueryChange={setGiftUserQuery}
             onDone={(giftId) => {
               setBulkUndoIds([]);
               props.onGiftDone(giftId);
@@ -1336,45 +1393,61 @@ function EventList(
   );
 }
 
-function giftIsToGuest(
-  targetUsername: string | null,
-  hostUsername: string | null,
-): boolean {
-  if (targetUsername == null || hostUsername == null) return false;
-  return targetUsername.toLowerCase() !== hostUsername.toLowerCase();
-}
-
 function GiftBulkBar(
   props: Readonly<{
     pendingIds: string[];
     showUndoAll: boolean;
     busy: boolean;
+    userFilterMode: GiftUserFilterMode;
+    userQuery: string;
+    onUserFilterModeChange: (mode: GiftUserFilterMode) => void;
+    onUserQueryChange: (query: string) => void;
     onDoneAll: (giftIds: string[]) => void;
     onUndoAll: () => void;
   }>,
 ) {
   const showDoneAll = props.pendingIds.length > 0;
-  if (!props.showUndoAll && !showDoneAll) return null;
   return (
     <div className="gift-done-all">
-      {props.showUndoAll ? (
-        <button
-          type="button"
-          className="tiny"
-          disabled={props.busy}
-          onClick={props.onUndoAll}>
-          Undo all
-        </button>
-      ) : null}
-      {showDoneAll ? (
-        <button
-          type="button"
-          className="primary tiny"
-          disabled={props.busy}
-          onClick={() => props.onDoneAll(props.pendingIds)}>
-          Mark all done
-        </button>
-      ) : null}
+      <div className="gift-user-filter">
+        <select
+          aria-label="Filter by user role"
+          value={props.userFilterMode}
+          onChange={(e) =>
+            props.onUserFilterModeChange(e.target.value as GiftUserFilterMode)
+          }>
+          <option value="all">all</option>
+          <option value="to">to</option>
+          <option value="from">from</option>
+        </select>
+        <input
+          type="search"
+          aria-label="Filter by username"
+          placeholder="filter user…"
+          value={props.userQuery}
+          onChange={(e) => props.onUserQueryChange(e.target.value)}
+        />
+      </div>
+      <div className="gift-bulk-actions">
+        {props.showUndoAll ? (
+          <button
+            type="button"
+            className="tiny"
+            disabled={props.busy}
+            onClick={props.onUndoAll}>
+            Undo all
+          </button>
+        ) : null}
+        {showDoneAll ? (
+          <button
+            type="button"
+            className="primary tiny"
+            disabled={props.busy}
+            onClick={() => props.onDoneAll(props.pendingIds)}>
+            Mark all done
+          </button>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -1383,7 +1456,6 @@ function GiftLine(
   props: Readonly<{
     item: GiftLogItem;
     important: boolean;
-    hostUsername: string | null;
     nameDisplayMode: NameDisplayMode;
     busy: boolean;
     onDone: (giftId: string) => void;
@@ -1393,7 +1465,6 @@ function GiftLine(
   const { item } = props;
   const pending = item.alertStatus !== 'done';
   const done = item.alertStatus === 'done';
-  const toGuest = giftIsToGuest(item.targetUsername, props.hostUsername);
   const targetLabel = formatGiftTarget(
     item.targetUsername,
     item.targetNickname,
@@ -1408,7 +1479,6 @@ function GiftLine(
     item.matchedRule && pending ? 'alert' : '',
     props.important ? 'hl-enabled' : '',
     done ? 'faded' : '',
-    toGuest ? 'gift-to-guest' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -1439,13 +1509,9 @@ function GiftLine(
           {targetLabel ? (
             <>
               {' '}
-              to{' '}
-              <span className={toGuest ? 'gift-target guest' : 'gift-target'}>
-                {targetLabel}
-              </span>
+              to <span className="gift-target">{targetLabel}</span>
             </>
           ) : null}
-          {toGuest ? <span className="tag tag-guest"> guest</span> : null}
           {item.matchedRule ? (
             <span className="tag"> {item.matchedRule}</span>
           ) : null}
@@ -1477,10 +1543,13 @@ function GiftList(
     items: GiftLogItem[];
     empty?: string;
     importantTypes: Set<string>;
-    hostUsername: string | null;
     nameDisplayMode: NameDisplayMode;
     busy: boolean;
     bulkUndoIds: string[];
+    userFilterMode: GiftUserFilterMode;
+    userQuery: string;
+    onUserFilterModeChange: (mode: GiftUserFilterMode) => void;
+    onUserQueryChange: (query: string) => void;
     onDone: (giftId: string) => void;
     onUndo: (giftId: string) => void;
     onDoneAll: (giftIds: string[]) => void;
@@ -1492,19 +1561,30 @@ function GiftList(
     .map((item) => item.id);
   const showUndoAll = props.bulkUndoIds.length > 0;
   const empty = props.empty ?? 'No gifts yet.';
+  const showBar =
+    props.items.length > 0 ||
+    showUndoAll ||
+    props.userQuery.trim() !== '' ||
+    props.userFilterMode !== 'all';
 
-  if (props.items.length === 0 && !showUndoAll) {
+  if (props.items.length === 0 && !showBar) {
     return <p className="muted feed-empty">{empty}</p>;
   }
   return (
     <div className="feed-inner gifts">
-      <GiftBulkBar
-        pendingIds={pendingIds}
-        showUndoAll={showUndoAll}
-        busy={props.busy}
-        onDoneAll={props.onDoneAll}
-        onUndoAll={props.onUndoAll}
-      />
+      {showBar ? (
+        <GiftBulkBar
+          pendingIds={pendingIds}
+          showUndoAll={showUndoAll}
+          busy={props.busy}
+          userFilterMode={props.userFilterMode}
+          userQuery={props.userQuery}
+          onUserFilterModeChange={props.onUserFilterModeChange}
+          onUserQueryChange={props.onUserQueryChange}
+          onDoneAll={props.onDoneAll}
+          onUndoAll={props.onUndoAll}
+        />
+      ) : null}
       {props.items.length === 0 ? (
         <p className="muted feed-empty">{empty}</p>
       ) : (
@@ -1516,7 +1596,6 @@ function GiftList(
               item.giftName &&
               props.importantTypes.has(item.giftName.toLowerCase()),
             )}
-            hostUsername={props.hostUsername}
             nameDisplayMode={props.nameDisplayMode}
             busy={props.busy}
             onDone={props.onDone}
@@ -1705,10 +1784,6 @@ function SettingsPanel(
       </div>
     </section>
   );
-}
-
-function isUnauthorized(err: unknown): boolean {
-  return err instanceof Error && err.message.startsWith('401:');
 }
 
 async function ensureWebPush(
