@@ -115,26 +115,43 @@ function saveGiftMinDiamonds(streamId: string, value: number) {
   localStorage.setItem(GIFT_MIN_DIAMONDS_KEY(streamId), String(value));
 }
 
+type GiftTypeFilterStore = {
+  on: Set<string>;
+  /** Last non-empty chip selection, used to leave All mode. */
+  lastOn: Set<string>;
+};
+
+function intersectAllowed(names: string[], allowed: string[]): Set<string> {
+  const allow = new Set(allowed);
+  return new Set(names.map((n) => n.toLowerCase()).filter((n) => allow.has(n)));
+}
+
 function loadGiftTypeFilters(
   streamId: string,
   enabledNames: string[],
-): Set<string> {
+): GiftTypeFilterStore {
   const allowed = enabledNames.map((n) => n.toLowerCase());
   try {
     const raw = localStorage.getItem(GIFT_TYPE_FILTER_KEY(streamId));
-    if (!raw) return new Set(allowed);
+    // Empty on = All gifts (no type filter)
+    if (!raw) return { on: new Set(), lastOn: new Set() };
     const parsed = JSON.parse(raw) as
       | string[]
-      | { on?: string[]; known?: string[] };
+      | { on?: string[]; known?: string[]; lastOn?: string[] };
     if (Array.isArray(parsed)) {
       const saved = new Set(parsed.map((n) => n.toLowerCase()));
-      return new Set(allowed.filter((n) => saved.has(n)));
+      const on = new Set(allowed.filter((n) => saved.has(n)));
+      return { on, lastOn: new Set(on) };
     }
-    const on = new Set((parsed.on ?? []).map((n) => n.toLowerCase()));
+    const lastOn = intersectAllowed(parsed.lastOn ?? [], allowed);
+    const onRaw = new Set((parsed.on ?? []).map((n) => n.toLowerCase()));
+    // Preserve All-gifts mode; do not auto-enable newly seen names
+    if (onRaw.size === 0) return { on: new Set(), lastOn };
     const known = new Set((parsed.known ?? []).map((n) => n.toLowerCase()));
-    return new Set(allowed.filter((n) => on.has(n) || !known.has(n)));
+    const on = new Set(allowed.filter((n) => onRaw.has(n) || !known.has(n)));
+    return { on, lastOn: lastOn.size > 0 ? lastOn : new Set(on) };
   } catch {
-    return new Set(allowed);
+    return { on: new Set(), lastOn: new Set() };
   }
 }
 
@@ -142,12 +159,14 @@ function saveGiftTypeFilters(
   streamId: string,
   types: Set<string>,
   enabledNames: string[],
+  lastOn: Set<string>,
 ) {
   localStorage.setItem(
     GIFT_TYPE_FILTER_KEY(streamId),
     JSON.stringify({
       on: [...types],
       known: enabledNames.map((n) => n.toLowerCase()),
+      lastOn: [...lastOn],
     }),
   );
 }
@@ -882,6 +901,9 @@ function LivePanel(
   const [giftTypeFilters, setGiftTypeFilters] = useState<Set<string>>(
     () => new Set(),
   );
+  const [giftTypeLastFilters, setGiftTypeLastFilters] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [giftUserFilterMode, setGiftUserFilterMode] =
     useState<GiftUserFilterMode>('all');
   const [giftUserQuery, setGiftUserQuery] = useState('');
@@ -903,7 +925,9 @@ function LivePanel(
     setChatFilters(loadChatFilters(props.selected));
     setGiftMinDiamondsText(String(loadGiftMinDiamonds(props.selected)));
     const names = enabledGiftKey ? enabledGiftKey.split('\0') : [];
-    setGiftTypeFilters(loadGiftTypeFilters(props.selected, names));
+    const stored = loadGiftTypeFilters(props.selected, names);
+    setGiftTypeFilters(stored.on);
+    setGiftTypeLastFilters(stored.lastOn);
   }, [props.selected, enabledGiftKey]);
 
   useEffect(() => {
@@ -942,24 +966,37 @@ function LivePanel(
   function toggleGiftType(name: string) {
     if (!props.selected) return;
     const key = name.toLowerCase();
-    setGiftTypeFilters((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      saveGiftTypeFilters(props.selected!, next, enabledGiftNames);
-      return next;
-    });
+    const next = new Set(giftTypeFilters);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    const lastOn = next.size > 0 ? next : giftTypeLastFilters;
+    if (next.size > 0) setGiftTypeLastFilters(next);
+    saveGiftTypeFilters(props.selected, next, enabledGiftNames, lastOn);
+    setGiftTypeFilters(next);
   }
 
   function toggleAllGiftTypes() {
     if (!props.selected) return;
-    const allKeys = enabledGiftNames.map((n) => n.toLowerCase());
-    setGiftTypeFilters((prev) => {
-      const allOn = allKeys.length > 0 && allKeys.every((k) => prev.has(k));
-      const next = allOn ? new Set<string>() : new Set(allKeys);
-      saveGiftTypeFilters(props.selected!, next, enabledGiftNames);
-      return next;
-    });
+    const allowed = new Set(enabledGiftNames.map((n) => n.toLowerCase()));
+    if (giftTypeFilters.size > 0) {
+      // Enter All: remember current chip selection for a quick return
+      const last = new Set(giftTypeFilters);
+      setGiftTypeLastFilters(last);
+      const next = new Set<string>();
+      saveGiftTypeFilters(props.selected, next, enabledGiftNames, last);
+      setGiftTypeFilters(next);
+      return;
+    }
+    // Leave All: restore previous chips, or all important types as fallback
+    let next = new Set(
+      [...giftTypeLastFilters].filter((k) => allowed.has(k)),
+    );
+    if (next.size === 0) next = new Set(allowed);
+    const lastOn =
+      giftTypeLastFilters.size > 0 ? giftTypeLastFilters : next;
+    saveGiftTypeFilters(props.selected, next, enabledGiftNames, lastOn);
+    setGiftTypeFilters(next);
+    if (giftTypeLastFilters.size === 0) setGiftTypeLastFilters(next);
   }
 
   if (!props.selected) {
@@ -1048,11 +1085,7 @@ function LivePanel(
                   <button
                     type="button"
                     className={
-                      enabledGiftNames.every((n) =>
-                        giftTypeFilters.has(n.toLowerCase()),
-                      )
-                        ? 'pill active'
-                        : 'pill'
+                      giftTypeFilters.size === 0 ? 'pill active' : 'pill'
                     }
                     onClick={() => toggleAllGiftTypes()}>
                     All
