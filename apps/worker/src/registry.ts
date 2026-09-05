@@ -21,7 +21,11 @@ import { TrackedSql } from './quota';
 import { sendWebPush, type StoredSubscription } from './push';
 
 /** Ephemeral watchers expire if the PWA stops heartbeating. Sticky check-ins do not. */
-const PRESENCE_TTL_MS = 20_000;
+const PRESENCE_TTL_MS = 45_000;
+/** Don't rewrite last_seen on every 10s poll — a read is cheaper than a write. */
+const PRESENCE_TOUCH_MIN_MS = 12_000;
+/** Sticky rows don't TTL-expire; only touch them for idle-checkout accounting. */
+const STICKY_TOUCH_MIN_MS = 5 * 60_000;
 const IDLE_CHECKOUT_MS = 60 * 60_000;
 const SUBSCRIPTION_CACHE_MS = 60_000;
 const MIGRATED_CLIENT_ID = 'migrated';
@@ -385,7 +389,9 @@ export class Registry implements DurableObject {
 
     for (const streamId of streamIds) {
       if (this.watcherCount(streamId) === 0) continue;
-      this.upsertWatcher(streamId, clientId, false);
+      this.upsertWatcher(streamId, clientId, false, {
+        touchMinMs: PRESENCE_TOUCH_MIN_MS,
+      });
     }
 
     this.pruneExpiredWatchers();
@@ -527,9 +533,31 @@ export class Registry implements DurableObject {
     streamId: string,
     clientId: string,
     sticky: boolean,
+    opts?: { touchMinMs?: number },
   ): void {
     const inherited = this.takeMigratedSticky(streamId);
     const makeSticky = sticky || inherited ? 1 : 0;
+    const now = Date.now();
+
+    if (opts?.touchMinMs != null) {
+      const existing = this.tracked
+        .exec<{ last_seen_at: number; sticky: number }>(
+          `SELECT last_seen_at, sticky FROM check_in_watchers
+           WHERE stream_id = ? AND client_id = ?`,
+          streamId,
+          clientId,
+        )
+        .toArray()[0];
+      if (existing) {
+        const minMs =
+          existing.sticky > 0 ? STICKY_TOUCH_MIN_MS : opts.touchMinMs;
+        const stickyUpgrade = makeSticky > existing.sticky;
+        if (!stickyUpgrade && now - existing.last_seen_at < minMs) {
+          return;
+        }
+      }
+    }
+
     this.tracked.exec(
       `INSERT INTO check_in_watchers (stream_id, client_id, sticky, last_seen_at)
        VALUES (?, ?, ?, ?)
@@ -543,7 +571,7 @@ export class Registry implements DurableObject {
       streamId,
       clientId,
       makeSticky,
-      Date.now(),
+      now,
     );
   }
 

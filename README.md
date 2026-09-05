@@ -143,6 +143,9 @@ tiktok-mod-tool-spec.md
 | `pnpm dev:relay` | Run production relay locally |
 | `pnpm dev:worker` | Build client + `wrangler dev` |
 | `pnpm build` | Build all packages |
+| `pnpm deploy` | Deploy Worker (Cloudflare) then Relay (Fly) |
+| `pnpm deploy:worker` | Build client + `wrangler deploy` |
+| `pnpm deploy:relay` | `fly deploy` using `apps/relay/fly.toml` |
 | `pnpm lint` | ESLint (incl. sonarjs) |
 | `pnpm typecheck` | TypeScript across workspaces |
 

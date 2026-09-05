@@ -5,12 +5,15 @@
 # Deploy from the repo root (Dockerfile copies workspace files):
 #   fly apps create tiktok-mod-relay
 #   fly secrets set EULER_API_KEY=... RELAY_SECRET=... WORKER_URL=https://your-worker.workers.dev
-#   fly deploy . --config apps/relay/fly.toml --ha=false --no-public-ips --yes
+#   pnpm deploy:relay
+#   # or: fly deploy . --config apps/relay/fly.toml --ha=false --no-public-ips --yes
 
 app = "tiktok-mod-relay"
 primary_region = "iad"
 
 [build]
+  # Path is relative to this fly.toml (apps/relay/). Build context is the repo
+  # root (`fly deploy .` / `fly deploy ../..`) so the Dockerfile COPY paths work.
   dockerfile = "Dockerfile"
 
 [env]

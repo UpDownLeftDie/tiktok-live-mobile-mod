@@ -11,7 +11,10 @@
     "dev:worker": "pnpm --filter @tiktok-mod/worker dev",
     "build": "pnpm --filter @tiktok-mod/shared build && pnpm --filter @tiktok-mod/relay build && pnpm --filter @tiktok-mod/worker build",
     "build:relay": "pnpm --filter @tiktok-mod/relay build",
-    "build:worker": "pnpm --filter @tiktok-mod/worker build"
+    "build:worker": "pnpm --filter @tiktok-mod/worker build",
+    "deploy": "pnpm deploy:worker && pnpm deploy:relay",
+    "deploy:worker": "pnpm --filter @tiktok-mod/worker deploy",
+    "deploy:relay": "fly deploy . --config apps/relay/fly.toml --ha=false --no-public-ips --yes"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

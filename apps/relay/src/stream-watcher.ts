@@ -244,11 +244,8 @@ export class StreamWatcher {
       this.postRoom('share', d, 'shared the stream');
     });
 
-    connection.on(WebcastEvent.MEMBER, (data) => {
-      const d = data as RoomEventLike;
-      this.postRoom('member', d, 'joined');
-    });
-
+    // Skip WebcastEvent.MEMBER — every viewer join on a busy room floods
+    // Durable Object row writes for little mod value (same rationale as LIKE).
     // Skip WebcastEvent.LIKE — too noisy for the events column.
 
     connection.on(WebcastEvent.STREAM_END, () => {

@@ -64,7 +64,6 @@ type BootState =
   | { phase: 'error'; message: string };
 
 const EVENT_FILTER_TYPES: { type: RoomEventType; label: string }[] = [
-  { type: 'member', label: 'Joins' },
   { type: 'follow', label: 'Follows' },
   { type: 'share', label: 'Shares' },
   { type: 'subscribe', label: 'Subs' },
