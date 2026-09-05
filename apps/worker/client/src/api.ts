@@ -1,10 +1,11 @@
-import type {
-  ChatHighlightConfig,
-  ConnectionStatus,
-  GiftCatalogItem,
-  GlobalSettings,
-  LiveFeed,
-  StreamConfig,
+import {
+  normalizeTikTokUsername,
+  type ChatHighlightConfig,
+  type ConnectionStatus,
+  type GiftCatalogItem,
+  type GlobalSettings,
+  type LiveFeed,
+  type StreamConfig,
 } from '@tiktok-mod/shared';
 
 export type PublicConfig = {
@@ -114,7 +115,7 @@ export function listStreams(): Promise<{
 export function addStream(streamId: string): Promise<{ streamId: string }> {
   return api('/api/streams', {
     method: 'POST',
-    body: JSON.stringify({ streamId }),
+    body: JSON.stringify({ streamId: normalizeTikTokUsername(streamId) }),
   });
 }
 

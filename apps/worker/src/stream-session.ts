@@ -5,6 +5,7 @@ import {
   formatPersonLabel,
   giftDiamondSpend,
   isDefaultAlertSettings,
+  normalizeTikTokUsername,
   resolveAlertSettings,
   resolveCatalogGiftName,
   type AlertSettingsOverrides,
@@ -1478,7 +1479,7 @@ function partialHighlightsForStorage(
   const stored: Partial<ChatHighlightConfig> = {};
   if (Array.isArray(h.highlightUsernames)) {
     const usernames = h.highlightUsernames
-      .map((u) => u.trim().replace(/^@/, ''))
+      .map((u) => normalizeTikTokUsername(u))
       .filter(Boolean);
     if (usernames.length > 0) stored.highlightUsernames = usernames;
   }

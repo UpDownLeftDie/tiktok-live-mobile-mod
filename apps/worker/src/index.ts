@@ -1,3 +1,4 @@
+import { normalizeTikTokUsername } from "@tiktok-mod/shared";
 import { requireModAuth, requireRelayAuth, registryStub, streamStub } from "./auth";
 import type { Env } from "./env";
 import { fetchQuotaSnapshot, quotaExceededResponse } from "./quota";
@@ -39,9 +40,11 @@ function matchStreamPath(
   const rest = pathname.slice(prefix.length);
   const idx = rest.indexOf("/");
   if (idx === -1) {
-    return suffix === "" ? decodeURIComponent(rest) : null;
+    return suffix === ""
+      ? normalizeTikTokUsername(decodeURIComponent(rest))
+      : null;
   }
-  const id = decodeURIComponent(rest.slice(0, idx));
+  const id = normalizeTikTokUsername(decodeURIComponent(rest.slice(0, idx)));
   const pathSuffix = rest.slice(idx);
   return pathSuffix === suffix ? id : null;
 }
@@ -165,7 +168,7 @@ function matchStreamPatch(
   );
   if (!match) return null;
   return {
-    streamId: decodeURIComponent(match[1]!),
+    streamId: normalizeTikTokUsername(decodeURIComponent(match[1]!)),
     kind: match[2] as "queue" | "gifts",
     id: decodeURIComponent(match[3]!),
   };

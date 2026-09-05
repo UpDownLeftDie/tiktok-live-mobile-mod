@@ -406,6 +406,14 @@ export interface PushNotificationPayload {
   actions?: Array<{ action: string; title: string }>;
 }
 
+/**
+ * Canonical TikTok uniqueId: trim, strip leading @, lowercase.
+ * TikTok stores handles lowercase; mixed case breaks room lookup.
+ */
+export function normalizeTikTokUsername(value: string): string {
+  return value.trim().replace(/^@/, '').toLowerCase();
+}
+
 /** Total diamonds spent for a gift event (unit value × combo/repeat count). */
 export function giftDiamondSpend(
   diamondValue: number | null | undefined,

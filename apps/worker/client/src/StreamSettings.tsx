@@ -2,6 +2,7 @@ import {
   DEFAULT_CHAT_HIGHLIGHTS,
   DEFAULT_NAME_DISPLAY_MODE,
   dedupeGiftCatalogByName,
+  normalizeTikTokUsername,
   type ChatHighlightConfig,
   type GiftAlertRule,
   type GiftCatalogItem,
@@ -280,7 +281,7 @@ function buildGlobalPayload(state: EditorState): GlobalSettings {
     chatKeywordFlags: splitSettingLines(state.keywordsText),
     chatHighlights: {
       highlightUsernames: splitSettingLines(state.highlightUsersText).map((s) =>
-        s.replace(/^@/, ''),
+        normalizeTikTokUsername(s),
       ),
       highlightRecentGifters: state.highlightRecentGifters !== false,
       recentGifterMinDiamonds: Number(state.recentGifterMinDiamonds) || 1,
@@ -337,7 +338,7 @@ function buildOverrideChatHighlights(
   state: EditorState,
 ): Partial<ChatHighlightConfig> | null {
   const highlightUsers = splitSettingLines(state.highlightUsersText).map((s) =>
-    s.replace(/^@/, ''),
+    normalizeTikTokUsername(s),
   );
   const chatHighlights: Partial<ChatHighlightConfig> = {};
   if (highlightUsers.length > 0) {

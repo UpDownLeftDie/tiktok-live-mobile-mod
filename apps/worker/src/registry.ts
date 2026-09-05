@@ -13,6 +13,7 @@ import {
   DEFAULT_GLOBAL_SETTINGS,
   dedupeGiftCatalogByName,
   GIFT_CATALOG,
+  normalizeTikTokUsername,
   parseNameDisplayMode,
 } from '@tiktok-mod/shared';
 import { parseClientId } from './auth';
@@ -100,6 +101,7 @@ export class Registry implements DurableObject {
     );
     this.ensureGlobalSettingsRow();
     this.migrateCheckedInToWatchers();
+    this.migrateStreamIdsToLowercase();
   }
 
   private ensureColumn(table: string, column: string, typeSql: string): void {
@@ -119,6 +121,55 @@ export class Registry implements DurableObject {
        SELECT stream_id, ?, 1, checked_in_at FROM checked_in`,
       MIGRATED_CLIENT_ID,
     );
+  }
+
+  /**
+   * TikTok uniqueIds are always lowercase. Collapse mixed-case registry rows
+   * onto the canonical id so the relay connects with the real handle.
+   */
+  private migrateStreamIdsToLowercase(): void {
+    this.migrateStreamIdColumn('streams', [
+      'stream_id',
+      'added_at',
+    ]);
+    this.migrateStreamIdColumn('checked_in', [
+      'stream_id',
+      'checked_in_at',
+    ]);
+    this.migrateStreamIdColumn('check_in_watchers', [
+      'stream_id',
+      'client_id',
+      'sticky',
+      'last_seen_at',
+    ]);
+  }
+
+  private migrateStreamIdColumn(
+    table: 'streams' | 'checked_in' | 'check_in_watchers',
+    columns: string[],
+  ): void {
+    const rows = this.tracked
+      .exec<{ stream_id: string }>(`SELECT DISTINCT stream_id FROM ${table}`)
+      .toArray();
+    for (const row of rows) {
+      const canonical = normalizeTikTokUsername(row.stream_id);
+      if (canonical === row.stream_id || !canonical) continue;
+      const colList = columns.join(', ');
+      const selectCols = columns
+        .map((c) => (c === 'stream_id' ? '?' : c))
+        .join(', ');
+      // Copy under the lowercase id (ignore if already present), then drop mixed-case.
+      this.tracked.exec(
+        `INSERT OR IGNORE INTO ${table} (${colList})
+         SELECT ${selectCols} FROM ${table} WHERE stream_id = ?`,
+        canonical,
+        row.stream_id,
+      );
+      this.tracked.exec(
+        `DELETE FROM ${table} WHERE stream_id = ?`,
+        row.stream_id,
+      );
+    }
   }
 
   private ensureGlobalSettingsRow(): void {
@@ -252,7 +303,7 @@ export class Registry implements DurableObject {
           ...DEFAULT_CHAT_HIGHLIGHTS,
           ...body.chatHighlights,
           highlightUsernames: (body.chatHighlights.highlightUsernames ?? [])
-            .map((u) => u.trim().replace(/^@/, ''))
+            .map((u) => normalizeTikTokUsername(u))
             .filter(Boolean),
         }
       : current.chatHighlights;
@@ -310,19 +361,23 @@ export class Registry implements DurableObject {
     if (!body.streamId) {
       return Response.json({ error: 'streamId required' }, { status: 400 });
     }
+    const streamId = normalizeTikTokUsername(body.streamId);
+    if (!streamId) {
+      return Response.json({ error: 'streamId required' }, { status: 400 });
+    }
     const clientId = parseClientId(body.clientId);
     if (!clientId) {
       return Response.json({ error: 'clientId required' }, { status: 400 });
     }
-    this.upsertWatcher(body.streamId, clientId, true);
+    this.upsertWatcher(streamId, clientId, true);
     this.tracked.exec(
       `INSERT INTO streams (stream_id, added_at) VALUES (?, ?)
        ON CONFLICT(stream_id) DO NOTHING`,
-      body.streamId,
+      streamId,
       Date.now(),
     );
-    this.syncCheckedInRow(body.streamId);
-    return Response.json(this.watcherStatus(body.streamId, clientId));
+    this.syncCheckedInRow(streamId);
+    return Response.json(this.watcherStatus(streamId, clientId));
   }
 
   private async checkOut(request: Request): Promise<Response> {
@@ -334,6 +389,10 @@ export class Registry implements DurableObject {
     if (!body.streamId) {
       return Response.json({ error: 'streamId required' }, { status: 400 });
     }
+    const streamId = normalizeTikTokUsername(body.streamId);
+    if (!streamId) {
+      return Response.json({ error: 'streamId required' }, { status: 400 });
+    }
     const clientId = parseClientId(body.clientId);
     if (!clientId) {
       return Response.json({ error: 'clientId required' }, { status: 400 });
@@ -341,18 +400,18 @@ export class Registry implements DurableObject {
     if (body.force === true) {
       this.tracked.exec(
         'DELETE FROM check_in_watchers WHERE stream_id = ?',
-        body.streamId,
+        streamId,
       );
     } else {
       this.tracked.exec(
         'DELETE FROM check_in_watchers WHERE stream_id = ? AND client_id = ?',
-        body.streamId,
+        streamId,
         clientId,
       );
     }
     this.pruneExpiredWatchers();
-    this.syncCheckedInRow(body.streamId);
-    return Response.json(this.watcherStatus(body.streamId, clientId));
+    this.syncCheckedInRow(streamId);
+    return Response.json(this.watcherStatus(streamId, clientId));
   }
 
   private async touchPresence(request: Request): Promise<Response> {
@@ -365,7 +424,10 @@ export class Registry implements DurableObject {
       return Response.json({ error: 'clientId required' }, { status: 400 });
     }
     const streamIds = Array.isArray(body.streamIds)
-      ? body.streamIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      ? body.streamIds
+          .filter((id): id is string => typeof id === 'string' && id.length > 0)
+          .map((id) => normalizeTikTokUsername(id))
+          .filter(Boolean)
       : [];
 
     const before = this.activeStreamIdSet();
@@ -437,7 +499,7 @@ export class Registry implements DurableObject {
 
   private async addStream(request: Request): Promise<Response> {
     const body = (await request.json()) as { streamId: string };
-    const streamId = body.streamId?.trim().replace(/^@/, '');
+    const streamId = normalizeTikTokUsername(body.streamId ?? '');
     if (!streamId) {
       return Response.json({ error: 'streamId required' }, { status: 400 });
     }
@@ -451,7 +513,9 @@ export class Registry implements DurableObject {
   }
 
   private async removeStream(path: string): Promise<Response> {
-    const streamId = decodeURIComponent(path.slice('/streams/'.length));
+    const streamId = normalizeTikTokUsername(
+      decodeURIComponent(path.slice('/streams/'.length)),
+    );
     const wasActive = this.activeStreamIdSet().has(streamId);
     this.tracked.exec(
       'DELETE FROM streams WHERE stream_id = ?',
