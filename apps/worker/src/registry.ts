@@ -66,7 +66,8 @@ export class Registry implements DurableObject {
         endpoint TEXT PRIMARY KEY,
         p256dh TEXT NOT NULL,
         auth TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        client_id TEXT NOT NULL DEFAULT ''
       );
       CREATE TABLE IF NOT EXISTS gift_catalog (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -88,8 +89,23 @@ export class Registry implements DurableObject {
         PRIMARY KEY (stream_id, client_id)
       );
     `);
+    this.ensureColumn(
+      'push_subscriptions',
+      'client_id',
+      "TEXT NOT NULL DEFAULT ''",
+    );
     this.ensureGlobalSettingsRow();
     this.migrateCheckedInToWatchers();
+  }
+
+  private ensureColumn(table: string, column: string, typeSql: string): void {
+    try {
+      this.tracked.exec(
+        `ALTER TABLE ${table} ADD COLUMN ${column} ${typeSql}`,
+      );
+    } catch {
+      // column already exists
+    }
   }
 
   /** Existing stream-level check-ins become a sticky placeholder until a real device claims them. */
@@ -147,7 +163,7 @@ export class Registry implements DurableObject {
       case 'POST /push':
         return this.push(request);
       case 'POST /test-push':
-        return this.testPush();
+        return this.testPush(request);
       case 'GET /gift-catalog':
         return this.getGiftCatalog();
       case 'PUT /gift-catalog':
@@ -664,18 +680,27 @@ export class Registry implements DurableObject {
     const sub = (await request.json()) as {
       endpoint?: string;
       keys?: { p256dh?: string; auth?: string };
+      clientId?: unknown;
     };
+    const clientId = parseClientId(sub.clientId);
+    if (!clientId) {
+      return Response.json({ error: 'clientId required' }, { status: 400 });
+    }
     if (!sub.endpoint || !sub.keys?.p256dh || !sub.keys?.auth) {
       return Response.json({ error: 'invalid subscription' }, { status: 400 });
     }
     this.tracked.exec(
-      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth`,
+      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at, client_id)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(endpoint) DO UPDATE SET
+         p256dh = excluded.p256dh,
+         auth = excluded.auth,
+         client_id = excluded.client_id`,
       sub.endpoint,
       sub.keys.p256dh,
       sub.keys.auth,
       Date.now(),
+      clientId,
     );
     this.subscriptionCache = null;
     return Response.json({ ok: true });
@@ -687,15 +712,28 @@ export class Registry implements DurableObject {
     return Response.json({ ok: true, results });
   }
 
-  private async testPush(): Promise<Response> {
-    const results = await this.broadcast({
-      title: 'Test push',
-      body: 'If you see this, Web Push is working.',
-      tag: `test-${Date.now()}`,
-      streamId: '',
-      queueItemId: '',
-      actions: [{ action: 'done', title: 'Done' }],
-    });
+  private async testPush(request: Request): Promise<Response> {
+    let body: { clientId?: unknown } = {};
+    try {
+      body = (await request.json()) as { clientId?: unknown };
+    } catch {
+      // empty body
+    }
+    const clientId = parseClientId(body.clientId);
+    if (!clientId) {
+      return Response.json({ error: 'clientId required' }, { status: 400 });
+    }
+    const results = await this.broadcast(
+      {
+        title: 'Test push',
+        body: 'If you see this, Web Push is working.',
+        tag: `test-${Date.now()}`,
+        streamId: '',
+        queueItemId: '',
+        actions: [{ action: 'done', title: 'Done' }],
+      },
+      { clientId },
+    );
     return Response.json({ ok: true, results });
   }
 
@@ -760,11 +798,49 @@ export class Registry implements DurableObject {
       .toArray();
   }
 
+  /** Sticky check-in watchers for a stream — checked-out devices are excluded. */
+  private listSubscriptionsForStream(streamId: string): StoredSubscription[] {
+    return this.tracked
+      .exec<{
+        endpoint: string;
+        p256dh: string;
+        auth: string;
+      }>(
+        `SELECT ps.endpoint, ps.p256dh, ps.auth
+         FROM push_subscriptions ps
+         INNER JOIN check_in_watchers w
+           ON w.client_id = ps.client_id
+         WHERE w.stream_id = ? AND w.sticky = 1`,
+        streamId,
+      )
+      .toArray();
+  }
+
+  private listSubscriptionsForClient(clientId: string): StoredSubscription[] {
+    return this.tracked
+      .exec<{
+        endpoint: string;
+        p256dh: string;
+        auth: string;
+      }>(
+        'SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE client_id = ?',
+        clientId,
+      )
+      .toArray();
+  }
+
   private async broadcast(
     payload: PushNotificationPayload,
+    opts?: { clientId?: string },
   ): Promise<Array<{ endpoint: string; status: number }>> {
+    let subs: StoredSubscription[] = [];
+    if (payload.streamId) {
+      subs = this.listSubscriptionsForStream(payload.streamId);
+    } else if (opts?.clientId) {
+      subs = this.listSubscriptionsForClient(opts.clientId);
+    }
     const results: Array<{ endpoint: string; status: number }> = [];
-    for (const sub of this.listSubscriptions()) {
+    for (const sub of subs) {
       const result = await sendWebPush(this.env, sub, payload);
       results.push({ endpoint: sub.endpoint, status: result.status });
       if (result.status === 404 || result.status === 410) {

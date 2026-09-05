@@ -343,6 +343,10 @@ textarea {
 
 .gift-line {
   font-size: 1rem;
+  /* Same gutter whether highlighted/alert or not so Done stays aligned. */
+  padding: 0.2rem 0.35rem;
+  border-left: 3px solid transparent;
+  border-radius: 6px;
 }
 
 .feed-line.faded {
@@ -401,12 +405,12 @@ textarea {
 
 .gift-line.hl-enabled:not(.faded) {
   background: color-mix(in srgb, var(--accent) 14%, transparent);
-  border-radius: 6px;
-  padding: 0.2rem 0.35rem;
 }
 
-.gift-line.hl-enabled.alert:not(.faded) {
-  padding-left: 0.45rem;
+.gift-line.alert:not(.faded) {
+  border-left-color: var(--accent);
+  /* Override .feed-line.alert padding-left so width matches non-alert rows. */
+  padding-left: 0.35rem;
 }
 
 .gift-name {

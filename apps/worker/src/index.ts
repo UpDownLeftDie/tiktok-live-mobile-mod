@@ -246,7 +246,11 @@ async function handlePushRoutes(
     const denied = requireModAuth(request, env);
     if (denied) return denied;
     return registryStub(env).fetch(
-      new Request("https://registry/test-push", { method: "POST" }),
+      new Request("https://registry/test-push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: await request.text(),
+      }),
     );
   }
 

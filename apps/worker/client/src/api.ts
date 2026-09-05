@@ -297,12 +297,18 @@ export function subscribePush(
 ): Promise<unknown> {
   return api('/api/subscribe', {
     method: 'POST',
-    body: JSON.stringify(subscription),
+    body: JSON.stringify({
+      ...subscription,
+      clientId: getClientId(),
+    }),
   });
 }
 
 export function testPush(): Promise<unknown> {
-  return api('/api/test-push', { method: 'POST' });
+  return api('/api/test-push', {
+    method: 'POST',
+    body: JSON.stringify({ clientId: getClientId() }),
+  });
 }
 
 export type QuotaMetric = {
