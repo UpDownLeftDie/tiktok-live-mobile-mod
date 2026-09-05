@@ -42,6 +42,10 @@ export class StreamWatcher {
   private loopPromise: Promise<void> | null = null;
   private connectedOnce = false;
   private loggedWaiting = false;
+  /** True after the first STREAM_END for the current live session (dedupe posts). */
+  private streamEndPosted = false;
+  /** Set by STREAM_END so the loop backs off like offline instead of reconnecting immediately. */
+  private awaitOfflineBackoff = false;
 
   constructor(
     readonly streamId: string,
@@ -52,6 +56,8 @@ export class StreamWatcher {
   start(): void {
     if (this.loopPromise) return;
     this.stopping = false;
+    this.streamEndPosted = false;
+    this.awaitOfflineBackoff = false;
     this.loopPromise = this.runLoop().finally(() => {
       this.loopPromise = null;
     });
@@ -105,9 +111,24 @@ export class StreamWatcher {
         await this.connectOnce();
         this.connectedOnce = true;
         this.loggedWaiting = false;
-        await this.reportStatus('live');
+        if (!this.awaitOfflineBackoff) {
+          await this.reportStatus('live');
+        }
         await this.waitUntilStoppedOrDisconnected();
-        if (!this.stopping && this.connectedOnce) {
+        if (this.stopping) break;
+        if (this.awaitOfflineBackoff) {
+          this.awaitOfflineBackoff = false;
+          await this.reportStatus('offline', 'stream_ended');
+          if (!this.loggedWaiting) {
+            console.log(
+              `[relay] @${this.streamId} stream ended; retrying every ${OFFLINE_RETRY_MS / 1000}s`,
+            );
+            this.loggedWaiting = true;
+          }
+          await sleep(OFFLINE_RETRY_MS);
+          continue;
+        }
+        if (this.connectedOnce) {
           await this.reportStatus('disconnected', 'tiktok_ws_disconnected');
         }
       } catch (err) {
@@ -154,6 +175,9 @@ export class StreamWatcher {
   }
 
   private async connectOnce(): Promise<void> {
+    this.streamEndPosted = false;
+    this.awaitOfflineBackoff = false;
+
     const connection = new TikTokLiveConnection(this.streamId, {
       signApiKey: this.apiKey,
       enableExtendedGiftInfo: false,
@@ -228,6 +252,9 @@ export class StreamWatcher {
     // Skip WebcastEvent.LIKE — too noisy for the events column.
 
     connection.on(WebcastEvent.STREAM_END, () => {
+      this.awaitOfflineBackoff = true;
+      if (this.streamEndPosted) return;
+      this.streamEndPosted = true;
       this.postRoom('stream_end', {}, 'Stream ended');
     });
 
